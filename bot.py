@@ -97,15 +97,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id  = update.effective_chat.id
     topic    = get_topic(update)
     logger.info(f"Messaggio da topic thread_id={getattr(update.message, 'message_thread_id', None)}, topic={topic}")
-    logger.info(f"chat_id={chat_id} thread_id={getattr(update.message, 'message_thread_id', None)}")
     emoji    = TOPIC_EMOJI.get(topic, "💬")
 
     # ── TOPIC GUARD ──────────────────────────────────────────────────────────
-    if topic != "default":
+    # Il topic "news" ha il suo guard dedicato (solo videogiochi)
+    # Gli altri topic usano il guard generico
+    if topic == "news":
+        # Guard specifico per Luca: accetta solo domande su videogiochi e industria
+        from agents import call_llm
+        guard_result = await call_llm(
+            system="""Sei un classificatore. Decidi se la domanda riguarda videogiochi, industria videoludica, gaming o cultura pop connessa.
+Rispondi SOLO con JSON: {"ok": true} oppure {"ok": false}""",
+            messages=[{"role": "user", "content": f"Domanda: {question}"}],
+            max_tokens=20
+        )
+        import json as _json
+        try:
+            ok = _json.loads(guard_result.strip()).get("ok", True)
+        except Exception:
+            ok = True
+
+        if not ok:
+            await update.message.reply_text(
+                "🎮 Questo topic è dedicato ai *videogiochi* e all'industria gaming.\n\n"
+                "Per altre domande usa il topic giusto:\n"
+                "🔍 Ricerca · 💻 Coding · 🧠 Brainstorming · 📊 Analisi",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+
+    elif topic != "default":
         from agents import topic_guard
         guard = await topic_guard(question, topic)
         if not guard["match"]:
-            suggested     = guard["suggested"]
+            suggested       = guard["suggested"]
             suggested_emoji = TOPIC_EMOJI.get(suggested, "💬")
             await update.message.reply_text(
                 f"⚠️ Questa domanda non è nel topic giusto!\n\n"
@@ -401,4 +426,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
