@@ -248,6 +248,103 @@ Regole:
     )
 
 
+# ── FETCH RECENTI (per /news on-demand) ──────────────────────────────────────
+
+async def fetch_recent_news(max_items: int = 20) -> list[dict]:
+    """
+    Scarica le ultime notizie da multiplayer.it senza filtrare per seen_news.
+    Usato dal comando /news per il sunto on-demand delle ultime ore.
+    """
+    try:
+        async with httpx.AsyncClient(
+            timeout=20,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"},
+            follow_redirects=True,
+        ) as client:
+            resp = await client.get(NEWS_PAGE_URL)
+            resp.raise_for_status()
+    except Exception as e:
+        logger.error(f"Errore fetch recenti: {e}")
+        return []
+
+    soup     = BeautifulSoup(resp.text, "html.parser")
+    seen_urls: set[str]  = set()
+    news:      list[dict] = []
+
+    for a in soup.find_all("a", href=True):
+        href: str = a["href"]
+        if "/notizie/" not in href:
+            continue
+
+        url = (BASE_URL + href) if href.startswith("/") else href
+        url = url.split("?")[0].rstrip("/")
+
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+
+        if any(p in url.lower() for p in SKIP_PATTERNS):
+            continue
+
+        title = a.get_text(strip=True)
+        if not title or len(title) < 15:
+            continue
+
+        news.append({"title": title, "url": url})
+        if len(news) >= max_items:
+            break
+
+    logger.info(f"Notizie recenti trovate: {len(news)}")
+    return news
+
+
+async def luca_news_summary(news_items: list[dict], hours: int = 4) -> str:
+    """
+    Luca fa un sunto delle ultime N ore di notizie su multiplayer.it.
+    Chiamato dal comando /news on-demand.
+    """
+    if not news_items:
+        return (
+            "🎮 *Sunto notizie*\n\n"
+            "Niente di rilevante nelle ultime ore su Multiplayer.it. "
+            "Il settore respira — o forse stanno tutti preparando qualcosa."
+        )
+
+    news_list = "\n".join(
+        f"{i+1}. {item['title']}" for i, item in enumerate(news_items[:15])
+    )
+
+    links = "\n".join(
+        f"• [{item['title'][:60]}]({item['url']})"
+        for item in news_items[:8]
+    )
+
+    system = f"""{SOUL_LUCA}
+
+Hai appena controllato Multiplayer.it. Devi fare un sunto rapido delle ultime {hours} ore per chi te lo chiede sul canale Telegram.
+
+Struttura OBBLIGATORIA:
+1. Una riga d'apertura che dice quante notizie ci sono e il tono generale
+2. Le 3-5 notizie più rilevanti con 1-2 frasi di commento ciascuna
+3. Una riga finale opzionale se c'è un tema ricorrente
+
+Inizia con: 🎮 *Ultime {hours} ore su Multiplayer.it*
+
+Tono: diretto, critico, come faresti in una chat veloce con un collega.
+Lunghezza: 150-250 parole. Scrivi in italiano. Usa *grassetto* per i titoli."""
+
+    summary = await call_llm(
+        system=system,
+        messages=[{
+            "role": "user",
+            "content": f"Notizie da Multiplayer.it:\n{news_list}"
+        }],
+        max_tokens=500,
+    )
+
+    return f"{summary}\n\n{links}"
+
+
 # ── FORMATTAZIONE ─────────────────────────────────────────────────────────────
 
 def format_news_message(title: str, url: str, comment: str) -> str:

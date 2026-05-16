@@ -8,7 +8,8 @@ from telegram.constants import ParseMode, ChatAction
 from agents import run_pipeline
 from memory import init_db, get_memory, set_memory, update_topics, format_memory_for_prompt
 from news_agent import (
-    fetch_new_multiplayer_news, luca_comment_news, luca_daily_digest,
+    fetch_new_multiplayer_news, fetch_recent_news,
+    luca_comment_news, luca_daily_digest, luca_news_summary,
     format_news_message, get_yesterday_news, mark_seen, init_news_db,
     luca_answer_question,
 )
@@ -261,6 +262,26 @@ async def cmd_dietro(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /news — chiede a Luca un sunto delle ultime 4 ore di notizie su multiplayer.it.
+    Funziona ovunque: chat privata, gruppo, qualsiasi topic.
+    """
+    status = await update.message.reply_text("🎮 *Luca* sta leggendo le ultime notizie...", parse_mode=ParseMode.MARKDOWN)
+    try:
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id,
+            action=ChatAction.TYPING
+        )
+        news_items = await fetch_recent_news(max_items=20)
+        summary    = await luca_news_summary(news_items, hours=4)
+        await status.delete()
+        await update.message.reply_text(summary, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"Errore /news: {e}", exc_info=True)
+        await status.edit_text("⚠️ Errore nel recupero delle notizie. Riprova tra qualche secondo.")
+
+
 # ── JOB: NEWS AUTOMATICHE ─────────────────────────────────────────────────────
 
 async def job_check_news(context):
@@ -333,6 +354,7 @@ async def post_init(app):
         BotCommand("memoria",  "Cosa ricordo di te"),
         BotCommand("nota",     "Aggiungi una nota su di te"),
         BotCommand("dietro",   "Toggle ragionamento interno"),
+        BotCommand("news",     "Sunto ultime 4 ore da Multiplayer.it"),
     ])
 
     # ── Job: controlla news ogni 30 minuti ────────────────────────────────────
@@ -366,6 +388,7 @@ def main():
     app.add_handler(CommandHandler("memoria",  cmd_memoria))
     app.add_handler(CommandHandler("nota",     cmd_nota))
     app.add_handler(CommandHandler("dietro",   cmd_dietro))
+    app.add_handler(CommandHandler("news",     cmd_news))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot avviato!")
