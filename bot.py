@@ -81,6 +81,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Messaggio da topic thread_id={getattr(update.message, 'message_thread_id', None)}, topic={topic}")
     emoji    = TOPIC_EMOJI.get(topic, "💬")
 
+    # ── TOPIC GUARD ──────────────────────────────────────────────────────────
+    if topic != "default":
+        from agents import topic_guard
+        guard = await topic_guard(question, topic)
+        if not guard["match"]:
+            suggested     = guard["suggested"]
+            suggested_emoji = TOPIC_EMOJI.get(suggested, "💬")
+            await update.message.reply_text(
+                f"⚠️ Questa domanda non è nel topic giusto!\n\n"
+                f"Sei nel topic {emoji} *{topic}*, ma sembra più adatta a "
+                f"{suggested_emoji} *{suggested}*.\n\n"
+                f"_{guard['reason']}_\n\n"
+                f"Scrivi lì la stessa domanda e ti rispondo al meglio 🙂",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+    # ─────────────────────────────────────────────────────────────────────────
+
     # Carica la memoria utente per iniettarla nel contesto
     memory_context = await format_memory_for_prompt(user_id)
 

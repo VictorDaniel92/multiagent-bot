@@ -70,6 +70,64 @@ TOPIC_CONFIGS = {
 }
 
 
+# ── TOPIC GUARD ───────────────────────────────────────────────────────────────
+
+# Descrizioni dei topic usate dal guard per classificare la domanda
+TOPIC_DESCRIPTIONS = {
+    "ricerca":       "informazioni generali, notizie, fatti, storia, scienza, attualità",
+    "coding":        "programmazione, codice, bug, script, linguaggi, API, software, tech",
+    "brainstorming": "idee creative, spunti, inventare, proporre alternative, pensiero laterale",
+    "analisi":       "analisi strutturata, confronto, pro e contro, valutazione, dati, statistiche",
+}
+
+async def topic_guard(question: str, current_topic: str) -> dict:
+    """
+    Verifica se la domanda è coerente col topic attuale.
+    Ritorna {"match": bool, "suggested": str, "reason": str}
+    """
+    if current_topic not in TOPIC_DESCRIPTIONS:
+        return {"match": True, "suggested": current_topic, "reason": ""}
+
+    topic_list = "\n".join(
+        f'- "{t}": {desc}' for t, desc in TOPIC_DESCRIPTIONS.items()
+    )
+
+    system = """Sei un classificatore di messaggi per un bot Telegram multi-topic.
+Il tuo unico compito è capire se una domanda è nel topic giusto.
+Rispondi SOLO con JSON valido, nessun testo aggiuntivo."""
+
+    prompt = f"""Topic attuale: "{current_topic}" ({TOPIC_DESCRIPTIONS[current_topic]})
+
+Topic disponibili:
+{topic_list}
+
+Domanda dell'utente: "{question}"
+
+Rispondi con questo JSON:
+{{"match": true/false, "suggested": "topic_più_adatto", "reason": "breve spiegazione in italiano"}}
+
+- match: true se la domanda è ragionevolmente nel topic attuale (anche parzialmente)
+- suggested: il topic più adatto tra {list(TOPIC_DESCRIPTIONS.keys())}
+- Se match è true, suggested può essere uguale al topic attuale"""
+
+    import json, re
+    raw = await call_llm(
+        system=system,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=150
+    )
+    try:
+        data = json.loads(re.search(r'\{.*\}', raw, re.DOTALL).group())
+        return {
+            "match":     bool(data.get("match", True)),
+            "suggested": data.get("suggested", current_topic),
+            "reason":    data.get("reason", ""),
+        }
+    except Exception:
+        # In caso di errore di parsing, lascia passare
+        return {"match": True, "suggested": current_topic, "reason": ""}
+
+
 # ── LLM BASE ─────────────────────────────────────────────────────────────────
 
 async def call_llm(system: str, messages: list[dict], max_tokens: int = 1024) -> str:
