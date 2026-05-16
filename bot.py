@@ -97,6 +97,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id  = update.effective_chat.id
     topic    = get_topic(update)
     logger.info(f"Messaggio da topic thread_id={getattr(update.message, 'message_thread_id', None)}, topic={topic}")
+    logger.info(f"chat_id={chat_id} thread_id={getattr(update.message, 'message_thread_id', None)}")
     emoji    = TOPIC_EMOJI.get(topic, "💬")
 
     # ── TOPIC GUARD ──────────────────────────────────────────────────────────
