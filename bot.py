@@ -13,6 +13,9 @@ from news_agent import (
     format_news_message, get_yesterday_news, mark_seen, init_news_db,
     luca_answer_question,
 )
+from weather_agent import (
+    extract_city, giorgio_forecast, giorgio_morning_briefing, MORNING_CITIES
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -28,18 +31,18 @@ TOPIC_MAP = {
     4:    "coding",
     6:    "brainstorming",
     8:    "analisi",
-    57:   "news",
-    # ⬇ Crea il topic "News" nel gruppo e metti qui il suo thread_id
-    # Puoi trovarlo nei log dopo aver mandato un messaggio in quel topic
-    # Esempio: 10: "news",
+    57:  "news",
+    99:  "meteo",
+    # ⬇ Aggiungi qui i thread_id reali dopo aver creato i topic nel gruppo
+    # Esempio: 10: "news", 12: "meteo"
 }
 
 # ID della chat del gruppo (per i job automatici)
-# Trovalo nei log: effective_chat.id quando scrivi nel gruppo
 GROUP_CHAT_ID: int = int(os.environ.get("GROUP_CHAT_ID", "0"))
 
-# Thread ID del topic "News" — aggiornalo dopo aver creato il topic
-NEWS_TOPIC_ID: int | None = int(os.environ.get("NEWS_TOPIC_ID", "0")) or None
+# Thread ID dei topic — aggiornali dopo aver creato i topic nel gruppo
+NEWS_TOPIC_ID:  int | None = int(os.environ.get("NEWS_TOPIC_ID",  "0")) or None
+METEO_TOPIC_ID: int | None = int(os.environ.get("METEO_TOPIC_ID", "0")) or None
 
 # Emoji per ogni topic
 TOPIC_EMOJI = {
@@ -48,6 +51,7 @@ TOPIC_EMOJI = {
     "brainstorming": "🧠",
     "analisi":       "📊",
     "news":          "🎮",
+    "meteo":         "🌤️",
     "default":       "💬",
 }
 
@@ -127,6 +131,31 @@ Rispondi SOLO con JSON: {"ok": true} oppure {"ok": false}""",
             )
             return
 
+    elif topic == "meteo":
+        # Guard specifico per Giorgio: accetta solo domande sul meteo
+        from agents import call_llm
+        guard_result = await call_llm(
+            system="""Sei un classificatore. Decidi se la domanda riguarda il meteo, il tempo atmosferico, le previsioni o condizioni climatiche.
+Rispondi SOLO con JSON: {"ok": true} oppure {"ok": false}""",
+            messages=[{"role": "user", "content": f"Domanda: {question}"}],
+            max_tokens=20
+        )
+        import json as _json
+        try:
+            ok = _json.loads(guard_result.strip()).get("ok", True)
+        except Exception:
+            ok = True
+
+        if not ok:
+            await update.message.reply_text(
+                "🌤️ Questo topic è dedicato al *meteo*.\n\n"
+                "Chiedimi il tempo di una città, es: _\"che tempo fa a Roma?\"_\n\n"
+                "Per altre domande usa il topic giusto:\n"
+                "🔍 Ricerca · 💻 Coding · 🧠 Brainstorming · 📊 Analisi",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+
     elif topic != "default":
         from agents import topic_guard
         guard = await topic_guard(question, topic)
@@ -159,6 +188,28 @@ Rispondi SOLO con JSON: {"ok": true} oppure {"ok": false}""",
         except Exception as e:
             logger.error(f"Errore risposta Luca: {e}", exc_info=True)
             await status_msg.edit_text("⚠️ Errore. Riprova tra qualche secondo.")
+        return
+
+    if topic == "meteo":
+        status_msg = await update.message.reply_text("🌤️ *Giorgio* sta controllando le previsioni...", parse_mode=ParseMode.MARKDOWN)
+        try:
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            city = await extract_city(question)
+            if not city:
+                await status_msg.delete()
+                await update.message.reply_text(
+                    "🌍 Non ho trovato la città che cerchi.\n\n"
+                    "Città supportate: Milano, Roma, Lecce, Palo del Colle, Napoli, Torino, Firenze, Bologna, Venezia, Bari, Palermo.\n\n"
+                    "Prova con: _\"che tempo fa a Milano?\"_ oppure _\"previsioni Roma\"_",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            answer = await giorgio_forecast(city, hours=8)
+            await status_msg.delete()
+            await update.message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            logger.error(f"Errore risposta Giorgio: {e}", exc_info=True)
+            await status_msg.edit_text("⚠️ Errore nel recupero del meteo. Riprova tra qualche secondo.")
         return
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -309,6 +360,27 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status.edit_text("⚠️ Errore nel recupero delle notizie. Riprova tra qualche secondo.")
 
 
+async def job_morning_weather(context):
+    """
+    Ogni mattina alle 7:00 invia le previsioni del giorno
+    per Milano, Palo del Colle, Lecce e Roma nel topic meteo.
+    """
+    if not GROUP_CHAT_ID or not METEO_TOPIC_ID:
+        logger.warning("GROUP_CHAT_ID o METEO_TOPIC_ID non configurati — skip meteo")
+        return
+    try:
+        briefing = await giorgio_morning_briefing(MORNING_CITIES)
+        await context.bot.send_message(
+            chat_id=GROUP_CHAT_ID,
+            message_thread_id=METEO_TOPIC_ID,
+            text=briefing,
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        logger.info("Briefing meteo mattutino inviato ✅")
+    except Exception as e:
+        logger.error(f"Errore job meteo: {e}", exc_info=True)
+
+
 # ── JOB: NEWS AUTOMATICHE ─────────────────────────────────────────────────────
 
 async def job_check_news(context):
@@ -389,19 +461,29 @@ async def post_init(app):
     if os.environ.get("ENABLE_NEWS_JOB", "false").lower() == "true":
         app.job_queue.run_repeating(
             job_check_news,
-            interval=1800,   # 30 minuti
-            first=60,        # primo check dopo 1 minuto dall'avvio
+            interval=1800,
+            first=60,
             name="check_news",
         )
-        # ── Job: digest mattutino alle 9:00 (ora italiana = UTC+2 in estate) ─────
         app.job_queue.run_daily(
             job_daily_digest,
-            time=datetime.time(7, 0, 0),  # 07:00 UTC = 09:00 CEST
+            time=datetime.time(7, 0, 0),
             name="daily_digest",
         )
         logger.info("Job news schedulati ✅")
     else:
         logger.info("Job news disabilitati (ENABLE_NEWS_JOB != true)")
+
+    # ── Job: meteo mattutino alle 7:00 ────────────────────────────────────────
+    if os.environ.get("ENABLE_METEO_JOB", "false").lower() == "true":
+        app.job_queue.run_daily(
+            job_morning_weather,
+            time=datetime.time(5, 0, 0),  # 05:00 UTC = 07:00 CEST
+            name="morning_weather",
+        )
+        logger.info("Job meteo mattutino schedulato ✅")
+    else:
+        logger.info("Job meteo disabilitato (ENABLE_METEO_JOB != true)")
 
 
 def main():
