@@ -8,7 +8,7 @@ from sqlalchemy import Column, String, Text, Date, select, delete
 from sqlalchemy.orm import DeclarativeBase
 
 from agents import call_llm
-from memory import engine, SessionLocal  # riusa la stessa connessione Postgres
+import memory
 
 logger = logging.getLogger(__name__)
 
@@ -57,10 +57,10 @@ class SeenNews(NewsBase):
 
 async def init_news_db():
     """Crea la tabella seen_news se non esiste. Chiamato da post_init in bot.py."""
-    if not engine:
+    if not memory.engine:
         logger.warning("Engine DB non disponibile — news DB non inizializzato")
         return
-    async with engine.begin() as conn:
+    async with memory.engine.begin() as conn:
         await conn.run_sync(NewsBase.metadata.create_all)
     logger.info("DB news inizializzato ✅")
 
@@ -68,17 +68,17 @@ async def init_news_db():
 # ── DEDUPLICAZIONE ────────────────────────────────────────────────────────────
 
 async def is_seen(url: str) -> bool:
-    if not SessionLocal:
+    if not memory.SessionLocal:
         return False
-    async with SessionLocal() as db:
+    async with memory.SessionLocal() as db:
         result = await db.execute(select(SeenNews).where(SeenNews.url == url))
         return result.scalar_one_or_none() is not None
 
 
 async def mark_seen(url: str, title: str):
-    if not SessionLocal:
+    if not memory.SessionLocal:
         return
-    async with SessionLocal() as db:
+    async with memory.SessionLocal() as db:
         existing = await db.execute(select(SeenNews).where(SeenNews.url == url))
         if not existing.scalar_one_or_none():
             db.add(SeenNews(url=url, title=title, day=date.today()))
@@ -86,10 +86,10 @@ async def mark_seen(url: str, title: str):
 
 
 async def get_yesterday_news() -> list[dict]:
-    if not SessionLocal:
+    if not memory.SessionLocal:
         return []
     yesterday = date.today() - timedelta(days=1)
-    async with SessionLocal() as db:
+    async with memory.SessionLocal() as db:
         result = await db.execute(
             select(SeenNews).where(SeenNews.day == yesterday)
         )
@@ -99,10 +99,10 @@ async def get_yesterday_news() -> list[dict]:
 
 async def cleanup_old_news(keep_days: int = 30):
     """Rimuove notizie più vecchie di N giorni — chiamato dal job settimanale."""
-    if not SessionLocal:
+    if not memory.SessionLocal:
         return
     cutoff = date.today() - timedelta(days=keep_days)
-    async with SessionLocal() as db:
+    async with memory.SessionLocal() as db:
         await db.execute(delete(SeenNews).where(SeenNews.day < cutoff))
         await db.commit()
 
