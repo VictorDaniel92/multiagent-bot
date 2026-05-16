@@ -60,7 +60,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(answer) > 4000:
             answer = answer[:4000] + "\n\n_(risposta troncata)_"
 
-        await update.message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(answer)
 
         # Se l'utente ha usato /dietro in precedenza, mostra anche il ragionamento
         show_behind = context.user_data.get("show_behind", False)
