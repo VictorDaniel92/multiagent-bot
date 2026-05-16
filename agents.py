@@ -78,6 +78,7 @@ TOPIC_DESCRIPTIONS = {
     "coding":        "programmazione, codice, bug, script, linguaggi, API, software, tech",
     "brainstorming": "idee creative, spunti, inventare, proporre alternative, pensiero laterale",
     "analisi":       "analisi strutturata, confronto, pro e contro, valutazione, dati, statistiche",
+    "news":          "notizie videogiochi, gaming, recensioni, annunci, industria videoludica",
 }
 
 async def topic_guard(question: str, current_topic: str) -> dict:

@@ -223,6 +223,31 @@ Scrivi in italiano. Prosa fluida come un editoriale."""
     )
 
 
+async def luca_answer_question(question: str) -> str:
+    """
+    Luca risponde a una domanda libera dell'utente nel topic news.
+    Risponde come critico videoludico — con opinioni, contesto storico, senza filtri.
+    """
+    system = f"""{SOUL_LUCA}
+
+Un utente ti ha scritto nel topic news/videogiochi del canale Telegram.
+Rispondi come faresti in un editoriale: con competenza, opinioni nette e contesto.
+
+Regole:
+- Rispondi direttamente alla domanda senza preamboli
+- Se la domanda riguarda un gioco, uno studio o una tendenza del settore, porta la tua prospettiva critica
+- Puoi fare riferimenti storici ad altri giochi o momenti dell'industria
+- Lunghezza: 3-6 frasi, mai oltre
+- Formato Telegram: *grassetto* per titoli/nomi importanti
+- Scrivi in italiano"""
+
+    return await call_llm(
+        system=system,
+        messages=[{"role": "user", "content": question}],
+        max_tokens=350,
+    )
+
+
 # ── FORMATTAZIONE ─────────────────────────────────────────────────────────────
 
 def format_news_message(title: str, url: str, comment: str) -> str:

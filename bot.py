@@ -10,6 +10,7 @@ from memory import init_db, get_memory, set_memory, update_topics, format_memory
 from news_agent import (
     fetch_new_multiplayer_news, luca_comment_news, luca_daily_digest,
     format_news_message, get_yesterday_news, mark_seen, init_news_db,
+    luca_answer_question,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -95,7 +96,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id  = update.effective_chat.id
     topic    = get_topic(update)
     logger.info(f"Messaggio da topic thread_id={getattr(update.message, 'message_thread_id', None)}, topic={topic}")
-    logger.info(f"GROUP_CHAT_ID={update.effective_chat.id}")
     emoji    = TOPIC_EMOJI.get(topic, "💬")
 
     # ── TOPIC GUARD ──────────────────────────────────────────────────────────
@@ -118,6 +118,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Carica la memoria utente per iniettarla nel contesto
     memory_context = await format_memory_for_prompt(user_id)
+
+    # ── ROUTING PER TOPIC ────────────────────────────────────────────────────
+    # Ogni topic ha il suo agente dedicato
+    if topic == "news":
+        status_msg = await update.message.reply_text("🎮 *Luca* sta pensando...", parse_mode=ParseMode.MARKDOWN)
+        try:
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            answer = await luca_answer_question(question)
+            await status_msg.delete()
+            await update.message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            logger.error(f"Errore risposta Luca: {e}", exc_info=True)
+            await status_msg.edit_text("⚠️ Errore. Riprova tra qualche secondo.")
+        return
+    # ─────────────────────────────────────────────────────────────────────────
 
     status_msg = await update.message.reply_text(f"⏳ Avvio pipeline {emoji}...")
 
