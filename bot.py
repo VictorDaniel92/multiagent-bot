@@ -20,6 +20,11 @@ from news_agent import (
 from weather_agent import (
     extract_city, giorgio_forecast, giorgio_morning_briefing, MORNING_CITIES
 )
+from memory_vector import (
+    init_vector_db, save_conversation,
+    search_memories, format_memories_for_prompt,
+    get_recent_conversations,
+)
 from sophia_agent import (
     sophia_is_mentioned, sophia_route_request, sophia_format_agent_message,
     sophia_welcome, sophia_daily_recap, sophia_agent_status,
@@ -141,6 +146,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             return
 
+        # Controlla se è una domanda sulla memoria del gruppo
+        memory_triggers = r'\b(si è parlato|hai detto|ricordi|ha detto|parlato di|discusso|ieri|stamattina|oggi|recente|ultima volta)\b'
+        if re.search(memory_triggers, clean_question, re.IGNORECASE):
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            from sophia_agent import sophia_answer_with_memory
+            answer = await sophia_answer_with_memory(clean_question)
+            await message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
+            return
+
         # Routing intelligente
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
         routing = await sophia_route_request(clean_question)
@@ -232,6 +246,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             answer = await luca_answer_question(question)
             await status_msg.delete()
             await message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
+            await save_conversation(user_id=user_id, topic="news", agent="luca",
+                                    question=question, answer=answer)
         except Exception as e:
             logger.error(f"Errore Luca: {e}", exc_info=True)
             await status_msg.edit_text("⚠️ Errore. Riprova tra qualche secondo.")
@@ -274,6 +290,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             answer = await giorgio_forecast(city, hours=8)
             await status_msg.delete()
             await message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
+            await save_conversation(user_id=user_id, topic="meteo", agent="giorgio",
+                                    question=question, answer=answer)
         except Exception as e:
             logger.error(f"Errore Giorgio: {e}", exc_info=True)
             await status_msg.edit_text("⚠️ Errore meteo. Riprova tra qualche secondo.")
@@ -296,6 +314,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── PIPELINE GENERALE ─────────────────────────────────────────────────
     memory_context = await format_memory_for_prompt(user_id)
+
+    # Cerca ricordi semanticamente simili alla domanda
+    past_memories = await search_memories(question, user_id=user_id, topic=topic, limit=3)
+    if past_memories:
+        memory_context += "\n\n" + format_memories_for_prompt(past_memories)
+
     status_msg = await message.reply_text(f"⏳ Avvio pipeline {emoji}...")
 
     try:
@@ -311,6 +335,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if result["queries"]:
             await update_topics(user_id, result["queries"][:2])
+
+        # Salva la conversazione nel vector store
+        await save_conversation(
+            user_id=user_id,
+            topic=topic,
+            agent="alex",
+            question=question,
+            answer=result["answer"],
+        )
 
         if context.user_data.get("show_behind") and result["queries"]:
             await message.reply_text(build_behind_scenes(result), parse_mode=ParseMode.MARKDOWN)
@@ -522,6 +555,7 @@ async def job_check_reminders(context):
 async def post_init(app):
     await init_db()
     await init_news_db()
+    await init_vector_db()
     await app.bot.set_my_commands([
         BotCommand("start",   "Benvenuto e info"),
         BotCommand("agenti",  "Chi c'è nel gruppo"),

@@ -274,3 +274,54 @@ def sophia_get_due_reminders() -> list[dict]:
                 still_pending.append(r)
         _reminders[user_id] = still_pending
     return due
+
+
+# ── Memoria del gruppo ─────────────────────────────────────────────────────────
+
+async def sophia_answer_with_memory(question: str) -> str:
+    """
+    Sophia risponde a domande sulla memoria del gruppo tipo:
+    "di cosa si è parlato oggi?", "Luca ha detto qualcosa su X?"
+    Usa get_recent_conversations e search_memories dal vector store.
+    Import lazy per evitare circular import.
+    """
+    try:
+        from memory_vector import search_memories, get_recent_conversations, format_memories_for_prompt
+
+        # Cerca sia per similarità che per recency
+        similar  = await search_memories(question, limit=4, min_similarity=0.70)
+        recent   = await get_recent_conversations(limit=5)
+
+        # Deduplicazione per question
+        seen  = set()
+        combined = []
+        for m in similar + recent:
+            key = m["question"][:80]
+            if key not in seen:
+                seen.add(key)
+                combined.append(m)
+
+        if not combined:
+            return "Non ho ancora abbastanza memoria delle conversazioni nel gruppo. Man mano che gli agenti rispondono, inizierò a ricordare tutto! 😊"
+
+        memory_text = format_memories_for_prompt(combined, label="Conversazioni nel gruppo")
+
+        system = f"""{SOUL_SOPHIA}
+
+Hai accesso alla memoria delle conversazioni recenti nel gruppo.
+Rispondi alla domanda in modo naturale e preciso, citando gli agenti e i topic quando rilevante.
+Esempio: "Luca ne ha parlato ieri nel topic News — ha detto che..."
+Sii concisa, max 4 righe. Usa Markdown Telegram."""
+
+        return await call_llm(
+            system=system,
+            messages=[{
+                "role": "user",
+                "content": f"{memory_text}\n\nDomanda: {question}"
+            }],
+            max_tokens=300
+        )
+
+    except Exception as e:
+        logger.error(f"Errore sophia_answer_with_memory: {e}")
+        return "Non riesco ad accedere alla memoria in questo momento. Riprova tra poco!"
