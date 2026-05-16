@@ -169,8 +169,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 if agent == "giorgio":
                     city = await extract_city(sub_q)
+                    logger.info(f"[Sophia→Giorgio] sub_q={sub_q!r} city={city}")
                     if city:
-                        answer = await giorgio_forecast(city, hours=8)
+                        try:
+                            answer = await giorgio_forecast(city, hours=8)
+                        except Exception as geo_err:
+                            logger.error(f"[giorgio_forecast] {geo_err}", exc_info=True)
+                            answer = f"⚠️ Errore meteo: `{geo_err}`"
                     else:
                         answer = "🌍 Non ho trovato la città nella domanda."
                     await context.bot.send_message(
