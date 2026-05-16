@@ -1,11 +1,16 @@
 import os
 import logging
+import datetime
 from telegram import Update, BotCommand
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 from telegram.constants import ParseMode, ChatAction
 
 from agents import run_pipeline
 from memory import init_db, get_memory, set_memory, update_topics, format_memory_for_prompt
+from news_agent import (
+    fetch_new_multiplayer_news, luca_comment_news, luca_daily_digest,
+    format_news_message, get_yesterday_news, mark_seen, init_news_db,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -17,18 +22,29 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 # Puoi trovarli nei log quando mandi un messaggio in un topic
 TOPIC_MAP = {
     None: "default",
-    2: "ricerca",
-    4: "coding",
-    6: "brainstorming",
-    8: "analisi",
+    2:    "ricerca",
+    4:    "coding",
+    6:    "brainstorming",
+    8:    "analisi",
+    # ⬇ Crea il topic "News" nel gruppo e metti qui il suo thread_id
+    # Puoi trovarlo nei log dopo aver mandato un messaggio in quel topic
+    # Esempio: 10: "news",
 }
 
-# Emoji per ogni topic — usate nei messaggi di stato
+# ID della chat del gruppo (per i job automatici)
+# Trovalo nei log: effective_chat.id quando scrivi nel gruppo
+GROUP_CHAT_ID: int = int(os.environ.get("GROUP_CHAT_ID", "0"))
+
+# Thread ID del topic "News" — aggiornalo dopo aver creato il topic
+NEWS_TOPIC_ID: int | None = int(os.environ.get("NEWS_TOPIC_ID", "0")) or None
+
+# Emoji per ogni topic
 TOPIC_EMOJI = {
     "ricerca":       "🔍",
     "coding":        "💻",
     "brainstorming": "🧠",
     "analisi":       "📊",
+    "news":          "🎮",
     "default":       "💬",
 }
 
@@ -79,6 +95,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id  = update.effective_chat.id
     topic    = get_topic(update)
     logger.info(f"Messaggio da topic thread_id={getattr(update.message, 'message_thread_id', None)}, topic={topic}")
+    logger.info(f"GROUP_CHAT_ID={update.effective_chat.id}")
     emoji    = TOPIC_EMOJI.get(topic, "💬")
 
     # ── TOPIC GUARD ──────────────────────────────────────────────────────────
@@ -229,11 +246,72 @@ async def cmd_dietro(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ── JOB: NEWS AUTOMATICHE ─────────────────────────────────────────────────────
+
+async def job_check_news(context):
+    """
+    Controlla ogni 30 minuti se ci sono nuove notizie su multiplayer.it.
+    Le invia nel topic News con il commento di Luca.
+    """
+    if not GROUP_CHAT_ID or not NEWS_TOPIC_ID:
+        logger.warning("GROUP_CHAT_ID o NEWS_TOPIC_ID non configurati — skip job news")
+        return
+
+    new_news = await fetch_new_multiplayer_news(max_items=10)
+    if not new_news:
+        logger.info("Nessuna notizia nuova trovata")
+        return
+
+    for item in new_news:
+        try:
+            comment = await luca_comment_news(item["title"], item["url"])
+            msg     = format_news_message(item["title"], item["url"], comment)
+
+            await context.bot.send_message(
+                chat_id=GROUP_CHAT_ID,
+                message_thread_id=NEWS_TOPIC_ID,
+                text=msg,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=False,
+            )
+            mark_seen(item["url"], item["title"])
+            logger.info(f"Inviata notizia: {item['title'][:60]}")
+
+        except Exception as e:
+            logger.error(f"Errore invio notizia '{item['title'][:40]}': {e}")
+
+
+async def job_daily_digest(context):
+    """
+    Ogni mattina alle 9:00 invia la rassegna stampa di Luca
+    con le notizie più importanti del giorno prima.
+    """
+    if not GROUP_CHAT_ID or not NEWS_TOPIC_ID:
+        logger.warning("GROUP_CHAT_ID o NEWS_TOPIC_ID non configurati — skip digest")
+        return
+
+    try:
+        yesterday_news = get_yesterday_news()
+        digest = await luca_daily_digest(yesterday_news)
+
+        await context.bot.send_message(
+            chat_id=GROUP_CHAT_ID,
+            message_thread_id=NEWS_TOPIC_ID,
+            text=digest,
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        logger.info(f"Digest inviato ({len(yesterday_news)} notizie di ieri)")
+
+    except Exception as e:
+        logger.error(f"Errore invio digest: {e}")
+
+
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
 async def post_init(app):
-    """Inizializza il DB e imposta i comandi del bot."""
+    """Inizializza il DB, imposta i comandi e schedula i job automatici."""
     await init_db()
+    await init_news_db()
     await app.bot.set_my_commands([
         BotCommand("start",    "Benvenuto e info"),
         BotCommand("agenti",   "Info sugli agenti"),
@@ -241,6 +319,23 @@ async def post_init(app):
         BotCommand("nota",     "Aggiungi una nota su di te"),
         BotCommand("dietro",   "Toggle ragionamento interno"),
     ])
+
+    # ── Job: controlla news ogni 30 minuti ────────────────────────────────────
+    app.job_queue.run_repeating(
+        job_check_news,
+        interval=1800,   # 30 minuti
+        first=30,        # primo check dopo 30 secondi dall'avvio
+        name="check_news",
+    )
+
+    # ── Job: digest mattutino alle 9:00 (ora italiana = UTC+2 in estate) ─────
+    app.job_queue.run_daily(
+        job_daily_digest,
+        time=datetime.time(7, 0, 0),  # 07:00 UTC = 09:00 CEST
+        name="daily_digest",
+    )
+
+    logger.info("Job news schedulati ✅")
 
 
 def main():
@@ -267,3 +362,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
