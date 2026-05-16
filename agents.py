@@ -1,14 +1,78 @@
 import os
 import httpx
+import logging
+from pathlib import Path
 from search import web_search, format_results
+
+logger = logging.getLogger(__name__)
 
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 GROQ_MODEL   = "llama-3.3-70b-versatile"
 GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
 
+SOULS_DIR = Path(__file__).parent / "souls"
+
+
+# ── CARICAMENTO SOUL FILES ────────────────────────────────────────────────────
+
+def load_soul(name: str) -> str:
+    """
+    Carica un file soul dalla cartella souls/.
+    Se il file non esiste restituisce stringa vuota con warning.
+    """
+    path = SOULS_DIR / f"{name}.md"
+    if path.exists():
+        return path.read_text(encoding="utf-8")
+    logger.warning(f"Soul file non trovato: {path}")
+    return ""
+
+# Carica i soul all'avvio — così non li rilegge ad ogni messaggio
+SOUL_MAX   = load_soul("max")
+SOUL_SOFIA = load_soul("sofia")
+SOUL_ALEX  = load_soul("alex")
+SOUL_USER  = load_soul("user")
+
+
+# ── PIPELINE PER TOPIC ────────────────────────────────────────────────────────
+
+# Ogni topic ha una configurazione diversa che cambia il comportamento degli agenti
+TOPIC_CONFIGS = {
+    "ricerca": {
+        "max_queries":    3,
+        "sofia_focus":    "Cerca informazioni fattuali e aggiornate. Cita le fonti.",
+        "alex_style":     "Rispondi in modo informativo e preciso. Struttura la risposta con punti chiave.",
+        "use_search":     True,
+    },
+    "coding": {
+        "max_queries":    2,
+        "sofia_focus":    "Cerca documentazione tecnica, esempi di codice e best practice.",
+        "alex_style":     "Rispondi con esempi pratici di codice. Preferisci snippet funzionanti a spiegazioni teoriche.",
+        "use_search":     True,
+    },
+    "brainstorming": {
+        "max_queries":    1,
+        "sofia_focus":    "Cerca idee, esempi creativi e approcci alternativi. Sii aperta a connessioni inaspettate.",
+        "alex_style":     "Sii creativo e propositivo. Offri più prospettive. Non limitarti alla risposta ovvia.",
+        "use_search":     False,  # Brainstorming usa principalmente la conoscenza interna
+    },
+    "analisi": {
+        "max_queries":    2,
+        "sofia_focus":    "Cerca dati, statistiche e opinioni di esperti. Segnala i punti di vista contrastanti.",
+        "alex_style":     "Analizza il problema da più angolazioni. Struttura pro/contro. Sii obiettivo.",
+        "use_search":     True,
+    },
+    "default": {
+        "max_queries":    3,
+        "sofia_focus":    "Cerca informazioni rilevanti e accurate.",
+        "alex_style":     "Rispondi in modo chiaro e completo.",
+        "use_search":     True,
+    }
+}
+
+
+# ── LLM BASE ─────────────────────────────────────────────────────────────────
 
 async def call_llm(system: str, messages: list[dict], max_tokens: int = 1024) -> str:
-    """Chiamata base all'API Groq. Tutti gli agenti la usano."""
     async with httpx.AsyncClient(timeout=60) as client:
         response = await client.post(
             GROQ_URL,
@@ -25,144 +89,147 @@ async def call_llm(system: str, messages: list[dict], max_tokens: int = 1024) ->
         return data["choices"][0]["message"]["content"].strip()
 
 
-# ── AGENTE 1: MAX ─────────────────────────────────────────────────────────────
-# Max è il pianificatore. Freddo e diretto, decide cosa cercare.
-# Non sa ancora nulla della risposta — il suo unico job è trasformare
-# la domanda dell'utente in 1-3 query di ricerca ottimali.
+# ── AGENTE MAX ────────────────────────────────────────────────────────────────
 
-MAX_SYSTEM = """Sei Max, un assistente analitico e diretto.
-Il tuo unico compito è decidere quali query di ricerca web usare per rispondere alla domanda dell'utente.
-
-Regole:
-- Rispondi SOLO con le query, una per riga, senza spiegazioni
-- Massimo 3 query
-- Le query devono essere in italiano o inglese a seconda di cosa funziona meglio
-- Sii specifico: preferisci "champion league 2024 vincitore" a "calcio"
-- Se la domanda non richiede ricerca (es. calcoli, opinioni), rispondi con: NESSUNA_RICERCA"""
-
-async def max_plan(user_question: str) -> list[str]:
+async def max_plan(user_question: str, topic: str = "default", memory_context: str = "") -> list[str]:
     """
-    Max decide le query di ricerca.
-    Restituisce una lista di stringhe (le query) oppure lista vuota se non serve ricerca.
+    Max decide le query di ricerca basandosi sul suo SOUL e sulla config del topic.
     """
+    config = TOPIC_CONFIGS.get(topic, TOPIC_CONFIGS["default"])
+
+    # Se il topic non usa la ricerca, Max non pianifica nulla
+    if not config["use_search"]:
+        return []
+
+    system = f"""{SOUL_MAX}
+
+{SOUL_USER}
+
+{memory_context}
+
+## Contesto operativo
+Stai lavorando nel topic: {topic.upper()}
+Massimo query consentite: {config['max_queries']}
+
+Rispondi SOLO con le query di ricerca, una per riga, senza spiegazioni.
+Se la domanda non richiede ricerca esterna, rispondi con: NESSUNA_RICERCA"""
+
     result = await call_llm(
-        system=MAX_SYSTEM,
-        messages=[{"role": "user", "content": f"Domanda dell'utente: {user_question}"}],
+        system=system,
+        messages=[{"role": "user", "content": f"Domanda: {user_question}"}],
         max_tokens=200
     )
 
     if "NESSUNA_RICERCA" in result:
         return []
 
-    # Ogni riga non vuota è una query
     queries = [line.strip() for line in result.strip().splitlines() if line.strip()]
-    return queries[:3]  # massimo 3
+    return queries[:config["max_queries"]]
 
 
-# ── AGENTE 2: SOFIA ───────────────────────────────────────────────────────────
-# Sofia è la ricercatrice. Curiosa ed entusiasta, legge i risultati grezzi
-# e li sintetizza in un briefing chiaro per Alex.
+# ── AGENTE SOFIA ──────────────────────────────────────────────────────────────
 
-SOFIA_SYSTEM = """Sei Sofia, una ricercatrice curiosa ed entusiasta.
-Hai appena eseguito delle ricerche web e devi sintetizzare i risultati in un briefing
-chiaro e strutturato per un collega che dovrà rispondere all'utente.
-
-Regole:
-- Estrai solo le informazioni rilevanti alla domanda
-- Organizza per punti chiave
-- Segnala se le fonti si contraddicono
-- Sii concisa: massimo 300 parole
-- Non rispondere all'utente direttamente — stai scrivendo per un collega"""
-
-async def sofia_synthesize(user_question: str, queries: list[str]) -> tuple[str, str]:
+async def sofia_synthesize(
+    user_question: str,
+    queries: list[str],
+    topic: str = "default",
+    memory_context: str = ""
+) -> str:
     """
     Sofia esegue le ricerche e sintetizza i risultati.
-    Restituisce (briefing, raw_results) dove raw_results è il testo grezzo delle ricerche.
+    Il focus cambia in base al topic.
     """
-    # Esegue tutte le query e raccoglie i risultati
+    config = TOPIC_CONFIGS.get(topic, TOPIC_CONFIGS["default"])
+
+    # Esegue tutte le query
     all_results = []
     for query in queries:
         results = web_search(query, max_results=3)
         all_results.append(f"Query: '{query}'\n{format_results(results)}")
 
-    raw = "\n\n---\n\n".join(all_results)
+    raw = "\n\n---\n\n".join(all_results) if all_results else "Nessuna ricerca eseguita."
 
-    briefing = await call_llm(
-        system=SOFIA_SYSTEM,
+    system = f"""{SOUL_SOFIA}
+
+{SOUL_USER}
+
+{memory_context}
+
+## Focus per questo topic
+{config['sofia_focus']}
+
+Stai scrivendo un briefing per Alex, non per l'utente.
+Massimo 300 parole. Sii selettiva — includi solo ciò che è rilevante."""
+
+    return await call_llm(
+        system=system,
         messages=[{
             "role": "user",
-            "content": f"Domanda originale: {user_question}\n\nRisultati delle ricerche:\n{raw}"
+            "content": f"Domanda originale: {user_question}\n\nRisultati ricerche:\n{raw}"
         }],
-        max_tokens=500
+        max_tokens=600
     )
 
-    return briefing, raw
 
+# ── AGENTE ALEX ───────────────────────────────────────────────────────────────
 
-# ── AGENTE 3: ALEX ────────────────────────────────────────────────────────────
-# Alex è il comunicatore finale. Analitico e preciso, legge il piano di Max
-# e il briefing di Sofia, e costruisce la risposta definitiva per l'utente.
-
-ALEX_SYSTEM = """Sei Alex, un assistente preciso e affidabile.
-Hai ricevuto da due colleghi:
-- Max ha pianificato le query di ricerca
-- Sofia ha sintetizzato i risultati
-
-Il tuo compito è rispondere all'utente in modo chiaro, accurato e ben strutturato.
-
-Regole:
-- Rispondi direttamente alla domanda
-- Usa i dati del briefing di Sofia, non inventare
-- Formatta bene la risposta con Markdown (grassetto, liste) dove utile
-- Alla fine aggiungi una riga "📎 Fonti:" con i domini delle fonti principali se disponibili
-- Tono: professionale ma accessibile
-- Lingua: sempre italiano"""
-
-async def alex_answer(user_question: str, max_queries: list[str], sofia_briefing: str) -> str:
+async def alex_answer(
+    user_question: str,
+    max_queries: list[str],
+    sofia_briefing: str,
+    topic: str = "default",
+    memory_context: str = ""
+) -> str:
     """
     Alex produce la risposta finale per l'utente.
-    Riceve il contesto completo del lavoro degli altri agenti.
+    Lo stile cambia in base al topic.
     """
-    context = f"""Domanda dell'utente: {user_question}
+    config = TOPIC_CONFIGS.get(topic, TOPIC_CONFIGS["default"])
 
-Piano di ricerca di Max (query usate):
-{chr(10).join(f'- {q}' for q in max_queries) if max_queries else '- Nessuna ricerca necessaria'}
+    system = f"""{SOUL_ALEX}
 
-Briefing di Sofia (sintesi delle ricerche):
+{SOUL_USER}
+
+{memory_context}
+
+## Stile per questo topic
+{config['alex_style']}
+
+Rispondi sempre in italiano. Sii diretto — inizia subito con la risposta."""
+
+    context = f"""Domanda: {user_question}
+
+Query usate da Max:
+{chr(10).join(f'- {q}' for q in max_queries) if max_queries else '- Nessuna ricerca (risposta dalla conoscenza interna)'}
+
+Briefing di Sofia:
 {sofia_briefing}"""
 
-    answer = await call_llm(
-        system=ALEX_SYSTEM,
+    return await call_llm(
+        system=system,
         messages=[{"role": "user", "content": context}],
         max_tokens=1024
     )
 
-    return answer
 
+# ── PIPELINE COMPLETO ─────────────────────────────────────────────────────────
 
-# ── PIPELINE COMPLETA ─────────────────────────────────────────────────────────
-
-async def run_pipeline(user_question: str) -> dict:
+async def run_pipeline(user_question: str, topic: str = "default", memory_context: str = "") -> dict:
     """
-    Esegue il pipeline completo: Max → Sofia → Alex.
-    Restituisce un dizionario con i contributi di ogni agente
-    così il bot può mostrarli progressivamente su Telegram.
+    Esegue Max → Sofia → Alex con la configurazione del topic corretto.
     """
+    queries = await max_plan(user_question, topic, memory_context)
 
-    # Step 1: Max pianifica
-    queries = await max_plan(user_question)
-
-    # Step 2: Sofia ricerca e sintetizza (solo se ci sono query)
     if queries:
-        briefing, _ = await sofia_synthesize(user_question, queries)
+        briefing = await sofia_synthesize(user_question, queries, topic, memory_context)
     else:
-        briefing = "Nessuna ricerca necessaria per questa domanda."
+        briefing = "Nessuna ricerca eseguita — risposta basata sulla conoscenza interna."
 
-    # Step 3: Alex risponde
-    answer = await alex_answer(user_question, queries, briefing)
+    answer = await alex_answer(user_question, queries, briefing, topic, memory_context)
 
     return {
         "queries":  queries,
         "briefing": briefing,
         "answer":   answer,
+        "topic":    topic,
     }

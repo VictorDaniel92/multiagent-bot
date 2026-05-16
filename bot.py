@@ -1,166 +1,240 @@
 import os
-import asyncio
 import logging
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 from telegram.constants import ParseMode, ChatAction
 
 from agents import run_pipeline
+from memory import init_db, get_memory, set_memory, update_topics, format_memory_for_prompt
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 
+# Mappa topic_id Telegram → nome topic interno
+# Vai su Telegram, crea i topic nel gruppo e metti qui i loro ID
+# Puoi trovarli nei log quando mandi un messaggio in un topic
+TOPIC_MAP = {
+    None: "default",  # chat privata o topic sconosciuto
+    # Esempio: 5: "coding", 7: "brainstorming"
+    # Li aggiungeremo dopo aver creato i topic nel gruppo
+}
+
+# Emoji per ogni topic — usate nei messaggi di stato
+TOPIC_EMOJI = {
+    "ricerca":       "🔍",
+    "coding":        "💻",
+    "brainstorming": "🧠",
+    "analisi":       "📊",
+    "default":       "💬",
+}
+
+
+# ── UTILS ─────────────────────────────────────────────────────────────────────
+
+def get_topic(update: Update) -> str:
+    """Determina il topic dal thread_id del messaggio."""
+    thread_id = getattr(update.message, "message_thread_id", None)
+    return TOPIC_MAP.get(thread_id, "default")
+
 
 # ── HANDLERS ──────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id   = update.effective_user.id
+    user_name = update.effective_user.first_name
+
+    # Salva il nome nella memoria
+    await set_memory(user_id, "name", user_name)
+
     await update.message.reply_text(
-        "👋 Ciao! Sono un sistema multi-agente.\n\n"
-        "Mandami qualsiasi domanda e tre agenti collaboreranno per risponderti:\n\n"
-        "🎯 *Max* — pianifica le ricerche\n"
-        "🔍 *Sofia* — cerca e sintetizza\n"
-        "✍️ *Alex* — scrive la risposta finale\n\n"
-        "Puoi usare /dietro per vedere il ragionamento interno degli agenti.\n\n"
-        "Cosa vuoi sapere?",
+        f"👋 Ciao {user_name}! Sono un sistema multi-agente.\n\n"
+        f"Tre agenti collaborano per risponderti:\n\n"
+        f"🎯 *Max* — pianifica le ricerche\n"
+        f"🔍 *Sofia* — cerca e sintetizza\n"
+        f"✍️ *Alex* — scrive la risposta finale\n\n"
+        f"*Topic disponibili:*\n"
+        f"🔍 Ricerca generale\n"
+        f"💻 Coding & Tech\n"
+        f"🧠 Brainstorming\n"
+        f"📊 Analisi\n\n"
+        f"Comandi:\n"
+        f"/agenti — info sugli agenti\n"
+        f"/memoria — cosa ricordo di te\n"
+        f"/dietro — toggle ragionamento interno\n"
+        f"/nota [testo] — aggiungi una nota su di te",
         parse_mode=ParseMode.MARKDOWN
     )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handler principale: riceve il messaggio, avvia il pipeline,
-    aggiorna l'utente con messaggi progressivi mentre gli agenti lavorano.
-    """
-    question = update.message.text.strip()
+    question  = update.message.text.strip()
     if not question:
         return
 
-    chat_id = update.effective_chat.id
+    user_id  = update.effective_user.id
+    chat_id  = update.effective_chat.id
+    topic    = get_topic(update)
+    emoji    = TOPIC_EMOJI.get(topic, "💬")
 
-    # Messaggio di stato iniziale — verrà aggiornato man mano
-    status_msg = await update.message.reply_text("⏳ Avvio il pipeline...", parse_mode=ParseMode.MARKDOWN)
+    # Carica la memoria utente per iniettarla nel contesto
+    memory_context = await format_memory_for_prompt(user_id)
+
+    status_msg = await update.message.reply_text(f"⏳ Avvio pipeline {emoji}...")
 
     try:
-        # Invia "typing..." mentre elabora
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        result = await run_pipeline_with_updates(
+            question, topic, memory_context, status_msg, context.bot, chat_id
+        )
 
-        # Avvia il pipeline — i tre agenti lavorano in sequenza
-        # Usiamo asyncio per aggiornare lo stato mentre aspettiamo
-        result = await run_pipeline_with_updates(question, status_msg, context.bot, chat_id)
-
-        # Cancella il messaggio di stato
         await status_msg.delete()
 
-        # Risposta finale di Alex
         answer = result["answer"]
-
-        # Telegram ha un limite di 4096 caratteri per messaggio
         if len(answer) > 4000:
             answer = answer[:4000] + "\n\n_(risposta troncata)_"
 
         await update.message.reply_text(answer)
 
-        # Se l'utente ha usato /dietro in precedenza, mostra anche il ragionamento
-        show_behind = context.user_data.get("show_behind", False)
-        if show_behind and result["queries"]:
+        # Aggiorna memoria con i topic cercati
+        if result["queries"]:
+            await update_topics(user_id, result["queries"][:2])
+
+        # Mostra ragionamento interno se attivo
+        if context.user_data.get("show_behind") and result["queries"]:
             behind = build_behind_scenes(result)
             await update.message.reply_text(behind, parse_mode=ParseMode.MARKDOWN)
 
     except Exception as e:
-        logger.error(f"Errore nel pipeline: {e}", exc_info=True)
-        await status_msg.edit_text("⚠️ Si è verificato un errore. Riprova tra qualche secondo.")
+        logger.error(f"Errore pipeline: {e}", exc_info=True)
+        await status_msg.edit_text("⚠️ Errore. Riprova tra qualche secondo.")
 
 
-async def run_pipeline_with_updates(question: str, status_msg, bot, chat_id: int) -> dict:
-    """
-    Esegue il pipeline aggiornando il messaggio di stato ad ogni step.
-    Questo dà all'utente feedback visivo mentre gli agenti lavorano.
-    """
+async def run_pipeline_with_updates(
+    question: str, topic: str, memory_context: str,
+    status_msg, bot, chat_id: int
+) -> dict:
+    """Esegue il pipeline aggiornando il messaggio di stato ad ogni step."""
     from agents import max_plan, sofia_synthesize, alex_answer
 
-    # Step 1: Max
-    await status_msg.edit_text("🎯 *Max* sta pianificando le ricerche...", parse_mode=ParseMode.MARKDOWN)
+    await status_msg.edit_text("🎯 *Max* sta pianificando...", parse_mode=ParseMode.MARKDOWN)
     await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-    queries = await max_plan(question)
+    queries = await max_plan(question, topic, memory_context)
 
-    # Step 2: Sofia
     if queries:
-        query_preview = ", ".join(f'"{q}"' for q in queries[:2])
-        await status_msg.edit_text(
-            f"🔍 *Sofia* sta cercando: {query_preview}...",
-            parse_mode=ParseMode.MARKDOWN
-        )
+        preview = ", ".join(f'"{q}"' for q in queries[:2])
+        await status_msg.edit_text(f"🔍 *Sofia* sta cercando: {preview}...", parse_mode=ParseMode.MARKDOWN)
         await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        briefing, _ = await sofia_synthesize(question, queries)
+        briefing = await sofia_synthesize(question, queries, topic, memory_context)
     else:
-        briefing = "Nessuna ricerca necessaria per questa domanda."
+        briefing = "Nessuna ricerca — risposta dalla conoscenza interna."
 
-    # Step 3: Alex
-    await status_msg.edit_text("✍️ *Alex* sta scrivendo la risposta...", parse_mode=ParseMode.MARKDOWN)
+    await status_msg.edit_text("✍️ *Alex* sta scrivendo...", parse_mode=ParseMode.MARKDOWN)
     await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-    answer = await alex_answer(question, queries, briefing)
+    answer = await alex_answer(question, queries, briefing, topic, memory_context)
 
-    return {"queries": queries, "briefing": briefing, "answer": answer}
+    return {"queries": queries, "briefing": briefing, "answer": answer, "topic": topic}
 
 
 def build_behind_scenes(result: dict) -> str:
-    """Costruisce il messaggio 'dietro le quinte' con il ragionamento degli agenti."""
-    lines = ["🔬 *Dietro le quinte*\n"]
-
+    lines = [f"🔬 *Dietro le quinte* [{result['topic']}]\n"]
     if result["queries"]:
-        lines.append("🎯 *Max ha cercato:*")
+        lines.append("🎯 *Max ha pianificato:*")
         for q in result["queries"]:
             lines.append(f"  • `{q}`")
         lines.append("")
-
     lines.append("🔍 *Sofia ha sintetizzato:*")
-    briefing_short = result["briefing"][:600] + ("..." if len(result["briefing"]) > 600 else "")
+    briefing_short = result["briefing"][:500] + ("..." if len(result["briefing"]) > 500 else "")
     lines.append(briefing_short)
-
     return "\n".join(lines)
 
 
-async def toggle_behind(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /dietro — attiva/disattiva la visualizzazione del ragionamento interno."""
-    current = context.user_data.get("show_behind", False)
-    context.user_data["show_behind"] = not current
+async def cmd_memoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mostra cosa il sistema ricorda dell'utente."""
+    user_id = update.effective_user.id
+    memory  = await get_memory(user_id)
 
-    if not current:
-        await update.message.reply_text(
-            "🔬 Modalità *dietro le quinte* attivata!\n"
-            "Da ora vedrò anche il ragionamento degli agenti dopo ogni risposta.\n"
-            "Usa /dietro di nuovo per disattivarla.",
-            parse_mode=ParseMode.MARKDOWN
-        )
-    else:
-        await update.message.reply_text("✅ Modalità *dietro le quinte* disattivata.", parse_mode=ParseMode.MARKDOWN)
+    if not memory:
+        await update.message.reply_text("Non ricordo ancora nulla di te. Inizia a chattare!")
+        return
+
+    lines = ["🧠 *Cosa ricordo di te:*\n"]
+    for key, value in memory.items():
+        if isinstance(value, list):
+            value = ", ".join(value)
+        lines.append(f"• *{key}*: {value}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
-async def agenti(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /agenti — mostra info sugli agenti disponibili."""
+async def cmd_nota(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Salva una nota personale nella memoria."""
+    user_id = update.effective_user.id
+    nota    = " ".join(context.args) if context.args else ""
+
+    if not nota:
+        await update.message.reply_text("Uso: /nota [testo]\nEsempio: /nota preferisco risposte brevi")
+        return
+
+    await set_memory(user_id, "notes", nota)
+    await update.message.reply_text(f"✅ Nota salvata: _{nota}_", parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_agenti(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *Gli agenti del sistema*\n\n"
         "🎯 *Max* — Il Pianificatore\n"
-        "Freddo, diretto, efficiente. Analizza la tua domanda e decide esattamente cosa cercare sul web. Non parla mai con l'utente direttamente.\n\n"
+        "Freddo e diretto. Decide cosa cercare sul web. Non parla mai con te direttamente.\n\n"
         "🔍 *Sofia* — La Ricercatrice\n"
-        "Curiosa ed entusiasta. Esegue le ricerche web e trasforma i risultati grezzi in un briefing strutturato per Alex. Ama trovare connessioni inaspettate.\n\n"
+        "Curiosa ed entusiasta. Esegue le ricerche e sintetizza i risultati per Alex.\n\n"
         "✍️ *Alex* — Il Comunicatore\n"
-        "Preciso e affidabile. Legge il piano di Max e il briefing di Sofia, poi scrive la risposta finale per te. È lui che vedi sempre.\n\n"
-        "_Usa /dietro per vedere cosa fanno Max e Sofia in background._",
+        "Preciso e affidabile. Legge il lavoro degli altri e scrive la risposta finale.\n\n"
+        "🗂 *Topic disponibili:*\n"
+        "🔍 Ricerca — informazioni generali\n"
+        "💻 Coding — codice e tech\n"
+        "🧠 Brainstorming — idee creative\n"
+        "📊 Analisi — ragionamento strutturato",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+
+async def cmd_dietro(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    current = context.user_data.get("show_behind", False)
+    context.user_data["show_behind"] = not current
+    stato = "attivata ✅" if not current else "disattivata ❌"
+    await update.message.reply_text(
+        f"🔬 Modalità *dietro le quinte* {stato}",
         parse_mode=ParseMode.MARKDOWN
     )
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
-def main():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+async def post_init(app):
+    """Inizializza il DB e imposta i comandi del bot."""
+    await init_db()
+    await app.bot.set_my_commands([
+        BotCommand("start",    "Benvenuto e info"),
+        BotCommand("agenti",   "Info sugli agenti"),
+        BotCommand("memoria",  "Cosa ricordo di te"),
+        BotCommand("nota",     "Aggiungi una nota su di te"),
+        BotCommand("dietro",   "Toggle ragionamento interno"),
+    ])
 
-    app.add_handler(CommandHandler("start",   start))
-    app.add_handler(CommandHandler("agenti",  agenti))
-    app.add_handler(CommandHandler("dietro",  toggle_behind))
+
+def main():
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start",    start))
+    app.add_handler(CommandHandler("agenti",   cmd_agenti))
+    app.add_handler(CommandHandler("memoria",  cmd_memoria))
+    app.add_handler(CommandHandler("nota",     cmd_nota))
+    app.add_handler(CommandHandler("dietro",   cmd_dietro))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot avviato!")
