@@ -16,9 +16,11 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 # Vai su Telegram, crea i topic nel gruppo e metti qui i loro ID
 # Puoi trovarli nei log quando mandi un messaggio in un topic
 TOPIC_MAP = {
-    None: "default",  # chat privata o topic sconosciuto
-    # Esempio: 5: "coding", 7: "brainstorming"
-    # Li aggiungeremo dopo aver creato i topic nel gruppo
+    None: "default",
+    2: "ricerca",
+    4: "coding",
+    6: "brainstorming",
+    8: "analisi",
 }
 
 # Emoji per ogni topic — usate nei messaggi di stato
