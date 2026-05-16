@@ -40,7 +40,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     # Messaggio di stato iniziale — verrà aggiornato man mano
-    status_msg = await update.message.reply_text("🎯 *Max* sta pianificando le ricerche...", parse_mode=ParseMode.MARKDOWN)
+    status_msg = await update.message.reply_text("⏳ Avvio il pipeline...", parse_mode=ParseMode.MARKDOWN)
 
     try:
         # Invia "typing..." mentre elabora
