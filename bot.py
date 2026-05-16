@@ -1,8 +1,12 @@
 import os
+import re
 import logging
 import datetime
-from telegram import Update, BotCommand
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
+from telegram import Update, BotCommand, ChatMemberUpdated
+from telegram.ext import (
+    ApplicationBuilder, MessageHandler, CommandHandler,
+    ChatMemberHandler, filters, ContextTypes
+)
 from telegram.constants import ParseMode, ChatAction
 
 from agents import run_pipeline
@@ -16,114 +20,171 @@ from news_agent import (
 from weather_agent import (
     extract_city, giorgio_forecast, giorgio_morning_briefing, MORNING_CITIES
 )
+from sophia_agent import (
+    sophia_is_mentioned, sophia_route_request, sophia_format_agent_message,
+    sophia_welcome, sophia_daily_recap, sophia_agent_status,
+    sophia_log_activity, sophia_get_activity, sophia_reset_activity,
+    sophia_parse_reminder, sophia_add_reminder, sophia_get_due_reminders,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 
-# Mappa topic_id Telegram → nome topic interno
-# Vai su Telegram, crea i topic nel gruppo e metti qui i loro ID
-# Puoi trovarli nei log quando mandi un messaggio in un topic
+# ── Topic map ──────────────────────────────────────────────────────────────────
 TOPIC_MAP = {
-    None: "default",
+    None: "general",   # General → Sophia receptionist
     2:    "ricerca",
     4:    "coding",
     6:    "brainstorming",
     8:    "analisi",
-    57:  "news",
-    99:  "meteo",
-    # ⬇ Aggiungi qui i thread_id reali dopo aver creato i topic nel gruppo
-    # Esempio: 10: "news", 12: "meteo"
+    57:   "news",      # Topic News  (Luca)
+    99:   "meteo",     # Topic Meteo (Giorgio)
 }
 
-# ID della chat del gruppo (per i job automatici)
-GROUP_CHAT_ID: int = int(os.environ.get("GROUP_CHAT_ID", "0"))
+GROUP_CHAT_ID:  int      = int(os.environ.get("GROUP_CHAT_ID", "0"))
+NEWS_TOPIC_ID:  int|None = int(os.environ.get("NEWS_TOPIC_ID",  "57")) or None
+METEO_TOPIC_ID: int|None = int(os.environ.get("METEO_TOPIC_ID", "99")) or None
 
-# Thread ID dei topic — aggiornali dopo aver creato i topic nel gruppo
-NEWS_TOPIC_ID:  int | None = int(os.environ.get("NEWS_TOPIC_ID",  "0")) or None
-METEO_TOPIC_ID: int | None = int(os.environ.get("METEO_TOPIC_ID", "0")) or None
-
-# Emoji per ogni topic
 TOPIC_EMOJI = {
+    "general":       "🌸",
     "ricerca":       "🔍",
     "coding":        "💻",
     "brainstorming": "🧠",
     "analisi":       "📊",
     "news":          "🎮",
     "meteo":         "🌤️",
-    "default":       "💬",
 }
 
 
-# ── UTILS ─────────────────────────────────────────────────────────────────────
+# ── Utils ──────────────────────────────────────────────────────────────────────
 
 def get_topic(update: Update) -> str:
-    """Determina il topic dal thread_id del messaggio."""
     thread_id = getattr(update.message, "message_thread_id", None)
-    return TOPIC_MAP.get(thread_id, "default")
+    return TOPIC_MAP.get(thread_id, "ricerca")
 
 
-# ── HANDLERS ──────────────────────────────────────────────────────────────────
+# ── Handlers ───────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id   = update.effective_user.id
     user_name = update.effective_user.first_name
-
-    # Salva il nome nella memoria
     await set_memory(user_id, "name", user_name)
-
     await update.message.reply_text(
-        f"👋 Ciao {user_name}! Sono un sistema multi-agente.\n\n"
-        f"Tre agenti collaborano per risponderti:\n\n"
-        f"🎯 *Max* — pianifica le ricerche\n"
-        f"🔍 *Sofia* — cerca e sintetizza\n"
-        f"✍️ *Alex* — scrive la risposta finale\n\n"
-        f"*Topic disponibili:*\n"
-        f"🔍 Ricerca generale\n"
-        f"💻 Coding & Tech\n"
-        f"🧠 Brainstorming\n"
-        f"📊 Analisi\n\n"
-        f"Comandi:\n"
-        f"/agenti — info sugli agenti\n"
+        f"👋 Ciao {user_name}!\n\n"
+        f"In *General* trovi *Sophia* 🌸 — la receptionist del gruppo.\n"
+        f"Menzionala e lei ti smista dall'agente giusto!\n\n"
+        f"*Agenti specializzati:*\n"
+        f"🎮 *Luca* — Gaming & News (topic News)\n"
+        f"🌤️ *Giorgio* — Meteo (topic Meteo)\n"
+        f"🔍 *Max+Sofia+Alex* — Ricerca, Coding, Brainstorming, Analisi\n\n"
+        f"*Comandi:*\n"
+        f"/agenti — chi c'è nel gruppo\n"
         f"/memoria — cosa ricordo di te\n"
         f"/dietro — toggle ragionamento interno\n"
-        f"/nota [testo] — aggiungi una nota su di te",
+        f"/nota [testo] — aggiungi una nota su di te\n"
+        f"/news — ultime notizie gaming",
         parse_mode=ParseMode.MARKDOWN
     )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    question  = update.message.text.strip()
-    if not question:
+    message = update.message
+    if not message or not message.text:
         return
 
-    user_id  = update.effective_user.id
-    chat_id  = update.effective_chat.id
-    topic    = get_topic(update)
-    logger.info(f"Messaggio da topic thread_id={getattr(update.message, 'message_thread_id', None)}, topic={topic}")
-    emoji    = TOPIC_EMOJI.get(topic, "💬")
+    question  = message.text.strip()
+    user_id   = update.effective_user.id
+    user_name = update.effective_user.first_name or "utente"
+    chat_id   = update.effective_chat.id
+    topic     = get_topic(update)
+    thread_id = getattr(message, "message_thread_id", None)
 
-    # ── TOPIC GUARD ──────────────────────────────────────────────────────────
-    # Il topic "news" ha il suo guard dedicato (solo videogiochi)
-    # Gli altri topic usano il guard generico
+    # Logga attività per il recap serale
+    sophia_log_activity(topic)
+
+    # ── GENERAL — Solo Sophia, solo se menzionata ──────────────────────────
+    if topic == "general":
+        if not sophia_is_mentioned(question):
+            return  # Sophia non si intromette mai
+
+        # Pulisce la menzione dalla domanda
+        clean_question = re.sub(r'\b(sophia|sofia)[,:]?\s*', '', question, flags=re.IGNORECASE).strip()
+        if not clean_question:
+            await message.reply_text("Dimmi tutto! 😊 Come posso aiutarti?")
+            return
+
+        # Controlla se è un promemoria
+        if re.search(r'\bricordami\b', clean_question, re.IGNORECASE):
+            reminder_data = await sophia_parse_reminder(clean_question)
+            if reminder_data:
+                try:
+                    when = datetime.datetime.fromisoformat(reminder_data["when_iso"])
+                    sophia_add_reminder(user_id, chat_id, thread_id, when, reminder_data["what"])
+                    await message.reply_text(
+                        f"✅ Fatto! Ti ricorderò di *{reminder_data['what']}* {reminder_data['when_str']} 🗓",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                except Exception as e:
+                    logger.error(f"Errore promemoria: {e}")
+                    await message.reply_text(
+                        "Non sono riuscita a capire la data. Prova con: "
+                        "_'ricordami domani alle 9 di...'_",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+            else:
+                await message.reply_text(
+                    "Non ho capito bene quando vuoi il promemoria. "
+                    "Prova così: _'Sophia ricordami domani alle 9 di controllare il meteo'_",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            return
+
+        # Routing intelligente
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        routing = await sophia_route_request(clean_question)
+
+        # Risponde in General
+        await message.reply_text(routing["sophia_reply"], parse_mode=ParseMode.MARKDOWN)
+
+        # Se ha trovato un agente, gira la domanda nel topic giusto
+        if routing["agent"] and routing["topic_id"] and GROUP_CHAT_ID:
+            agent_msg = sophia_format_agent_message(
+                routing["agent"],
+                routing["rephrased_question"],
+                user_name
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=GROUP_CHAT_ID,
+                    message_thread_id=routing["topic_id"],
+                    text=agent_msg,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                logger.info(f"Sophia → {routing['agent']} (topic {routing['topic_id']})")
+            except Exception as e:
+                logger.error(f"Errore invio al topic {routing['topic_id']}: {e}")
+        return
+
+    emoji = TOPIC_EMOJI.get(topic, "💬")
+
+    # ── NEWS (Luca) ────────────────────────────────────────────────────────
     if topic == "news":
-        # Guard specifico per Luca: accetta solo domande su videogiochi e industria
         from agents import call_llm
+        import json as _json
         guard_result = await call_llm(
-            system="""Sei un classificatore. Decidi se la domanda riguarda videogiochi, industria videoludica, gaming o cultura pop connessa.
-Rispondi SOLO con JSON: {"ok": true} oppure {"ok": false}""",
+            system='Classificatore. La domanda riguarda videogiochi/gaming/industria videoludica? Rispondi SOLO con JSON: {"ok": true} oppure {"ok": false}',
             messages=[{"role": "user", "content": f"Domanda: {question}"}],
             max_tokens=20
         )
-        import json as _json
         try:
             ok = _json.loads(guard_result.strip()).get("ok", True)
         except Exception:
             ok = True
 
         if not ok:
-            await update.message.reply_text(
+            await message.reply_text(
                 "🎮 Questo topic è dedicato ai *videogiochi* e all'industria gaming.\n\n"
                 "Per altre domande usa il topic giusto:\n"
                 "🔍 Ricerca · 💻 Coding · 🧠 Brainstorming · 📊 Analisi",
@@ -131,122 +192,101 @@ Rispondi SOLO con JSON: {"ok": true} oppure {"ok": false}""",
             )
             return
 
-    elif topic == "meteo":
-        # Guard specifico per Giorgio: accetta solo domande sul meteo
+        status_msg = await message.reply_text("🎮 *Luca* sta pensando...", parse_mode=ParseMode.MARKDOWN)
+        try:
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            answer = await luca_answer_question(question)
+            await status_msg.delete()
+            await message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            logger.error(f"Errore Luca: {e}", exc_info=True)
+            await status_msg.edit_text("⚠️ Errore. Riprova tra qualche secondo.")
+        return
+
+    # ── METEO (Giorgio) ────────────────────────────────────────────────────
+    if topic == "meteo":
         from agents import call_llm
+        import json as _json
         guard_result = await call_llm(
-            system="""Sei un classificatore. Decidi se la domanda riguarda il meteo, il tempo atmosferico, le previsioni o condizioni climatiche.
-Rispondi SOLO con JSON: {"ok": true} oppure {"ok": false}""",
+            system='Classificatore. La domanda riguarda meteo/tempo atmosferico/previsioni? Rispondi SOLO con JSON: {"ok": true} oppure {"ok": false}',
             messages=[{"role": "user", "content": f"Domanda: {question}"}],
             max_tokens=20
         )
-        import json as _json
         try:
             ok = _json.loads(guard_result.strip()).get("ok", True)
         except Exception:
             ok = True
 
         if not ok:
-            await update.message.reply_text(
+            await message.reply_text(
                 "🌤️ Questo topic è dedicato al *meteo*.\n\n"
                 "Chiedimi il tempo di una città, es: _\"che tempo fa a Roma?\"_\n\n"
-                "Per altre domande usa il topic giusto:\n"
-                "🔍 Ricerca · 💻 Coding · 🧠 Brainstorming · 📊 Analisi",
+                "Per altre domande usa il topic giusto.",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
 
-    elif topic != "default":
-        from agents import topic_guard
-        guard = await topic_guard(question, topic)
-        if not guard["match"]:
-            suggested       = guard["suggested"]
-            suggested_emoji = TOPIC_EMOJI.get(suggested, "💬")
-            await update.message.reply_text(
-                f"⚠️ Questa domanda non è nel topic giusto!\n\n"
-                f"Sei nel topic {emoji} *{topic}*, ma sembra più adatta a "
-                f"{suggested_emoji} *{suggested}*.\n\n"
-                f"_{guard['reason']}_\n\n"
-                f"Scrivi lì la stessa domanda e ti rispondo al meglio 🙂",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-    # ─────────────────────────────────────────────────────────────────────────
-
-    # Carica la memoria utente per iniettarla nel contesto
-    memory_context = await format_memory_for_prompt(user_id)
-
-    # ── ROUTING PER TOPIC ────────────────────────────────────────────────────
-    # Ogni topic ha il suo agente dedicato
-    if topic == "news":
-        status_msg = await update.message.reply_text("🎮 *Luca* sta pensando...", parse_mode=ParseMode.MARKDOWN)
-        try:
-            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-            answer = await luca_answer_question(question)
-            await status_msg.delete()
-            await update.message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
-        except Exception as e:
-            logger.error(f"Errore risposta Luca: {e}", exc_info=True)
-            await status_msg.edit_text("⚠️ Errore. Riprova tra qualche secondo.")
-        return
-
-    if topic == "meteo":
-        status_msg = await update.message.reply_text("🌤️ *Giorgio* sta controllando le previsioni...", parse_mode=ParseMode.MARKDOWN)
+        status_msg = await message.reply_text("🌤️ *Giorgio* sta controllando le previsioni...", parse_mode=ParseMode.MARKDOWN)
         try:
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
             city = await extract_city(question)
             if not city:
                 await status_msg.delete()
-                await update.message.reply_text(
-                    "🌍 Non ho trovato la città che cerchi.\n\n"
-                    "Città supportate: Milano, Roma, Lecce, Palo del Colle, Napoli, Torino, Firenze, Bologna, Venezia, Bari, Palermo.\n\n"
-                    "Prova con: _\"che tempo fa a Milano?\"_ oppure _\"previsioni Roma\"_",
+                await message.reply_text(
+                    "🌍 Non ho trovato la città. Prova con: _\"che tempo fa a Milano?\"_",
                     parse_mode=ParseMode.MARKDOWN
                 )
                 return
             answer = await giorgio_forecast(city, hours=8)
             await status_msg.delete()
-            await update.message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
+            await message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
         except Exception as e:
-            logger.error(f"Errore risposta Giorgio: {e}", exc_info=True)
-            await status_msg.edit_text("⚠️ Errore nel recupero del meteo. Riprova tra qualche secondo.")
+            logger.error(f"Errore Giorgio: {e}", exc_info=True)
+            await status_msg.edit_text("⚠️ Errore meteo. Riprova tra qualche secondo.")
         return
-    # ─────────────────────────────────────────────────────────────────────────
 
-    status_msg = await update.message.reply_text(f"⏳ Avvio pipeline {emoji}...")
+    # ── TOPIC GUARD (ricerca, coding, brainstorming, analisi) ──────────────
+    from agents import topic_guard
+    guard = await topic_guard(question, topic)
+    if not guard["match"]:
+        suggested_emoji = TOPIC_EMOJI.get(guard["suggested"], "💬")
+        await message.reply_text(
+            f"⚠️ Questa domanda non è nel topic giusto!\n\n"
+            f"Sei in {emoji} *{topic}*, ma sembra più adatta a "
+            f"{suggested_emoji} *{guard['suggested']}*.\n\n"
+            f"_{guard['reason']}_\n\n"
+            f"Scrivi lì la stessa domanda 🙂",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    # ── PIPELINE GENERALE ─────────────────────────────────────────────────
+    memory_context = await format_memory_for_prompt(user_id)
+    status_msg = await message.reply_text(f"⏳ Avvio pipeline {emoji}...")
 
     try:
         result = await run_pipeline_with_updates(
             question, topic, memory_context, status_msg, context.bot, chat_id
         )
-
         await status_msg.delete()
 
         answer = result["answer"]
         if len(answer) > 4000:
             answer = answer[:4000] + "\n\n_(risposta troncata)_"
+        await message.reply_text(answer)
 
-        await update.message.reply_text(answer)
-
-        # Aggiorna memoria con i topic cercati
         if result["queries"]:
             await update_topics(user_id, result["queries"][:2])
 
-        # Mostra ragionamento interno se attivo
         if context.user_data.get("show_behind") and result["queries"]:
-            behind = build_behind_scenes(result)
-            await update.message.reply_text(behind, parse_mode=ParseMode.MARKDOWN)
+            await message.reply_text(build_behind_scenes(result), parse_mode=ParseMode.MARKDOWN)
 
     except Exception as e:
         logger.error(f"Errore pipeline: {e}", exc_info=True)
         await status_msg.edit_text("⚠️ Errore. Riprova tra qualche secondo.")
 
 
-async def run_pipeline_with_updates(
-    question: str, topic: str, memory_context: str,
-    status_msg, bot, chat_id: int
-) -> dict:
-    """Esegue il pipeline aggiornando il messaggio di stato ad ogni step."""
+async def run_pipeline_with_updates(question, topic, memory_context, status_msg, bot, chat_id):
     from agents import max_plan, sofia_synthesize, alex_answer
 
     await status_msg.edit_text("🎯 *Max* sta pianificando...", parse_mode=ParseMode.MARKDOWN)
@@ -268,7 +308,7 @@ async def run_pipeline_with_updates(
     return {"queries": queries, "briefing": briefing, "answer": answer, "topic": topic}
 
 
-def build_behind_scenes(result: dict) -> str:
+def build_behind_scenes(result):
     lines = [f"🔬 *Dietro le quinte* [{result['topic']}]\n"]
     if result["queries"]:
         lines.append("🎯 *Max ha pianificato:*")
@@ -281,209 +321,199 @@ def build_behind_scenes(result: dict) -> str:
     return "\n".join(lines)
 
 
+# ── Benvenuto nuovo membro ─────────────────────────────────────────────────────
+
+async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    result: ChatMemberUpdated = update.chat_member
+    if not result:
+        return
+    old_status = result.old_chat_member.status
+    new_status = result.new_chat_member.status
+    if old_status in ("left", "kicked") and new_status in ("member", "restricted"):
+        new_member_name = result.new_chat_member.user.first_name or "nuovo arrivato"
+        try:
+            welcome_msg = await sophia_welcome(new_member_name)
+            await context.bot.send_message(
+                chat_id=result.chat.id,
+                text=welcome_msg,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            logger.info(f"Sophia ha accolto {new_member_name}")
+        except Exception as e:
+            logger.error(f"Errore benvenuto: {e}")
+
+
+# ── Comandi ────────────────────────────────────────────────────────────────────
+
 async def cmd_memoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mostra cosa il sistema ricorda dell'utente."""
     user_id = update.effective_user.id
     memory  = await get_memory(user_id)
-
     if not memory:
         await update.message.reply_text("Non ricordo ancora nulla di te. Inizia a chattare!")
         return
-
     lines = ["🧠 *Cosa ricordo di te:*\n"]
     for key, value in memory.items():
         if isinstance(value, list):
             value = ", ".join(value)
         lines.append(f"• *{key}*: {value}")
-
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_nota(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Salva una nota personale nella memoria."""
     user_id = update.effective_user.id
     nota    = " ".join(context.args) if context.args else ""
-
     if not nota:
         await update.message.reply_text("Uso: /nota [testo]\nEsempio: /nota preferisco risposte brevi")
         return
-
     await set_memory(user_id, "notes", nota)
     await update.message.reply_text(f"✅ Nota salvata: _{nota}_", parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_agenti(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 *Gli agenti del sistema*\n\n"
-        "🎯 *Max* — Il Pianificatore\n"
-        "Freddo e diretto. Decide cosa cercare sul web. Non parla mai con te direttamente.\n\n"
-        "🔍 *Sofia* — La Ricercatrice\n"
-        "Curiosa ed entusiasta. Esegue le ricerche e sintetizza i risultati per Alex.\n\n"
-        "✍️ *Alex* — Il Comunicatore\n"
-        "Preciso e affidabile. Legge il lavoro degli altri e scrive la risposta finale.\n\n"
-        "🗂 *Topic disponibili:*\n"
-        "🔍 Ricerca — informazioni generali\n"
-        "💻 Coding — codice e tech\n"
-        "🧠 Brainstorming — idee creative\n"
-        "📊 Analisi — ragionamento strutturato",
-        parse_mode=ParseMode.MARKDOWN
-    )
+    topic = get_topic(update)
+    if topic == "general":
+        # In General risponde Sophia
+        await update.message.reply_text(sophia_agent_status(), parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text(
+            "🤖 *Gli agenti del sistema*\n\n"
+            "🌸 *Sophia* — Receptionist (General)\n"
+            "Ti smista verso l'agente giusto.\n\n"
+            "🎮 *Luca* — Gaming & News (topic News)\n"
+            "🌤️ *Giorgio* — Meteo (topic Meteo)\n\n"
+            "Nel gruppo ricerca/analisi:\n"
+            "🎯 *Max* · 🔍 *Sofia* · ✍️ *Alex*",
+            parse_mode=ParseMode.MARKDOWN
+        )
 
 
 async def cmd_dietro(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current = context.user_data.get("show_behind", False)
     context.user_data["show_behind"] = not current
     stato = "attivata ✅" if not current else "disattivata ❌"
-    await update.message.reply_text(
-        f"🔬 Modalità *dietro le quinte* {stato}",
-        parse_mode=ParseMode.MARKDOWN
-    )
+    await update.message.reply_text(f"🔬 Modalità *dietro le quinte* {stato}", parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /news — chiede a Luca un sunto delle ultime 4 ore di notizie su multiplayer.it.
-    Funziona ovunque: chat privata, gruppo, qualsiasi topic.
-    """
     status = await update.message.reply_text("🎮 *Luca* sta leggendo le ultime notizie...", parse_mode=ParseMode.MARKDOWN)
     try:
-        await context.bot.send_chat_action(
-            chat_id=update.effective_chat.id,
-            action=ChatAction.TYPING
-        )
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
         news_items = await fetch_recent_news(max_items=20)
         summary    = await luca_news_summary(news_items, hours=4)
         await status.delete()
         await update.message.reply_text(summary, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logger.error(f"Errore /news: {e}", exc_info=True)
-        await status.edit_text("⚠️ Errore nel recupero delle notizie. Riprova tra qualche secondo.")
+        await status.edit_text("⚠️ Errore nel recupero delle notizie.")
 
+
+# ── Job automatici ─────────────────────────────────────────────────────────────
 
 async def job_morning_weather(context):
-    """
-    Ogni mattina alle 7:00 invia le previsioni del giorno
-    per Milano, Palo del Colle, Lecce e Roma nel topic meteo.
-    """
     if not GROUP_CHAT_ID or not METEO_TOPIC_ID:
-        logger.warning("GROUP_CHAT_ID o METEO_TOPIC_ID non configurati — skip meteo")
         return
     try:
         briefing = await giorgio_morning_briefing(MORNING_CITIES)
         await context.bot.send_message(
-            chat_id=GROUP_CHAT_ID,
-            message_thread_id=METEO_TOPIC_ID,
-            text=briefing,
-            parse_mode=ParseMode.MARKDOWN,
+            chat_id=GROUP_CHAT_ID, message_thread_id=METEO_TOPIC_ID,
+            text=briefing, parse_mode=ParseMode.MARKDOWN,
         )
-        logger.info("Briefing meteo mattutino inviato ✅")
     except Exception as e:
-        logger.error(f"Errore job meteo: {e}", exc_info=True)
+        logger.error(f"Errore job meteo: {e}")
 
-
-# ── JOB: NEWS AUTOMATICHE ─────────────────────────────────────────────────────
 
 async def job_check_news(context):
-    """
-    Controlla ogni 30 minuti se ci sono nuove notizie su multiplayer.it.
-    Le invia nel topic News con il commento di Luca.
-    """
     if not GROUP_CHAT_ID or not NEWS_TOPIC_ID:
-        logger.warning("GROUP_CHAT_ID o NEWS_TOPIC_ID non configurati — skip job news")
         return
-
     new_news = await fetch_new_multiplayer_news(max_items=10)
-    if not new_news:
-        logger.info("Nessuna notizia nuova trovata")
-        return
-
-    for item in new_news:
+    for item in (new_news or []):
         try:
             comment = await luca_comment_news(item["title"], item["url"])
             msg     = format_news_message(item["title"], item["url"], comment)
-
             await context.bot.send_message(
-                chat_id=GROUP_CHAT_ID,
-                message_thread_id=NEWS_TOPIC_ID,
-                text=msg,
-                parse_mode=ParseMode.MARKDOWN,
-                disable_web_page_preview=False,
+                chat_id=GROUP_CHAT_ID, message_thread_id=NEWS_TOPIC_ID,
+                text=msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=False,
             )
             mark_seen(item["url"], item["title"])
-            logger.info(f"Inviata notizia: {item['title'][:60]}")
-
         except Exception as e:
-            logger.error(f"Errore invio notizia '{item['title'][:40]}': {e}")
+            logger.error(f"Errore notizia: {e}")
 
 
 async def job_daily_digest(context):
-    """
-    Ogni mattina alle 9:00 invia la rassegna stampa di Luca
-    con le notizie più importanti del giorno prima.
-    """
     if not GROUP_CHAT_ID or not NEWS_TOPIC_ID:
-        logger.warning("GROUP_CHAT_ID o NEWS_TOPIC_ID non configurati — skip digest")
         return
-
     try:
-        yesterday_news = get_yesterday_news()
-        digest = await luca_daily_digest(yesterday_news)
-
+        digest = await luca_daily_digest(get_yesterday_news())
         await context.bot.send_message(
-            chat_id=GROUP_CHAT_ID,
-            message_thread_id=NEWS_TOPIC_ID,
-            text=digest,
-            parse_mode=ParseMode.MARKDOWN,
+            chat_id=GROUP_CHAT_ID, message_thread_id=NEWS_TOPIC_ID,
+            text=digest, parse_mode=ParseMode.MARKDOWN,
         )
-        logger.info(f"Digest inviato ({len(yesterday_news)} notizie di ieri)")
-
     except Exception as e:
-        logger.error(f"Errore invio digest: {e}")
+        logger.error(f"Errore digest: {e}")
 
 
-# ── MAIN ──────────────────────────────────────────────────────────────────────
+async def job_sophia_daily_recap(context):
+    """Ogni sera alle 18:00 Sophia manda il recap in General."""
+    if not GROUP_CHAT_ID:
+        return
+    try:
+        recap = await sophia_daily_recap(sophia_get_activity())
+        await context.bot.send_message(
+            chat_id=GROUP_CHAT_ID, text=recap, parse_mode=ParseMode.MARKDOWN,
+        )
+        sophia_reset_activity()
+        logger.info("Recap Sophia ✅")
+    except Exception as e:
+        logger.error(f"Errore recap Sophia: {e}")
+
+
+async def job_check_reminders(context):
+    """Ogni minuto controlla i promemoria scaduti."""
+    for r in sophia_get_due_reminders():
+        try:
+            kwargs = {
+                "chat_id": r["chat_id"],
+                "text": f"🔔 *Promemoria!*\n\n_{r['text']}_",
+                "parse_mode": ParseMode.MARKDOWN,
+            }
+            if r.get("thread_id"):
+                kwargs["message_thread_id"] = r["thread_id"]
+            await context.bot.send_message(**kwargs)
+        except Exception as e:
+            logger.error(f"Errore promemoria: {e}")
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
 
 async def post_init(app):
-    """Inizializza il DB, imposta i comandi e schedula i job automatici."""
     await init_db()
     await init_news_db()
     await app.bot.set_my_commands([
-        BotCommand("start",    "Benvenuto e info"),
-        BotCommand("agenti",   "Info sugli agenti"),
-        BotCommand("memoria",  "Cosa ricordo di te"),
-        BotCommand("nota",     "Aggiungi una nota su di te"),
-        BotCommand("dietro",   "Toggle ragionamento interno"),
-        BotCommand("news",     "Sunto ultime 4 ore da Multiplayer.it"),
+        BotCommand("start",   "Benvenuto e info"),
+        BotCommand("agenti",  "Chi c'è nel gruppo"),
+        BotCommand("memoria", "Cosa ricordo di te"),
+        BotCommand("nota",    "Aggiungi una nota su di te"),
+        BotCommand("dietro",  "Toggle ragionamento interno"),
+        BotCommand("news",    "Ultime notizie gaming"),
     ])
 
-    # ── Job: controlla news ogni 30 minuti ────────────────────────────────────
-    # Parte solo se ENABLE_NEWS_JOB=true nelle variabili Railway
     if os.environ.get("ENABLE_NEWS_JOB", "false").lower() == "true":
-        app.job_queue.run_repeating(
-            job_check_news,
-            interval=1800,
-            first=60,
-            name="check_news",
-        )
-        app.job_queue.run_daily(
-            job_daily_digest,
-            time=datetime.time(7, 0, 0),
-            name="daily_digest",
-        )
-        logger.info("Job news schedulati ✅")
-    else:
-        logger.info("Job news disabilitati (ENABLE_NEWS_JOB != true)")
+        app.job_queue.run_repeating(job_check_news, interval=1800, first=60, name="check_news")
+        app.job_queue.run_daily(job_daily_digest, time=datetime.time(7, 0, 0), name="daily_digest")
 
-    # ── Job: meteo mattutino alle 7:00 ────────────────────────────────────────
     if os.environ.get("ENABLE_METEO_JOB", "false").lower() == "true":
         app.job_queue.run_daily(
-            job_morning_weather,
-            time=datetime.time(5, 0, 0),  # 05:00 UTC = 07:00 CEST
-            name="morning_weather",
+            job_morning_weather, time=datetime.time(5, 0, 0), name="morning_weather",
         )
-        logger.info("Job meteo mattutino schedulato ✅")
-    else:
-        logger.info("Job meteo disabilitato (ENABLE_METEO_JOB != true)")
+
+    if os.environ.get("ENABLE_SOPHIA_RECAP", "false").lower() == "true":
+        app.job_queue.run_daily(
+            job_sophia_daily_recap, time=datetime.time(16, 0, 0), name="sophia_recap",
+        )
+
+    # Promemoria sempre attivi
+    app.job_queue.run_repeating(job_check_reminders, interval=60, first=30, name="reminders")
+    logger.info("Bot inizializzato ✅")
 
 
 def main():
@@ -494,21 +524,25 @@ def main():
         .build()
     )
 
-    app.add_handler(CommandHandler("start",    start))
-    app.add_handler(CommandHandler("agenti",   cmd_agenti))
-    app.add_handler(CommandHandler("memoria",  cmd_memoria))
-    app.add_handler(CommandHandler("nota",     cmd_nota))
-    app.add_handler(CommandHandler("dietro",   cmd_dietro))
-    app.add_handler(CommandHandler("news",     cmd_news))
+    app.add_handler(CommandHandler("start",   start))
+    app.add_handler(CommandHandler("agenti",  cmd_agenti))
+    app.add_handler(CommandHandler("memoria", cmd_memoria))
+    app.add_handler(CommandHandler("nota",    cmd_nota))
+    app.add_handler(CommandHandler("dietro",  cmd_dietro))
+    app.add_handler(CommandHandler("news",    cmd_news))
+
+    # Benvenuto nuovi membri
+    app.add_handler(ChatMemberHandler(handle_new_member, ChatMemberHandler.CHAT_MEMBER))
+
+    # Messaggi
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot avviato!")
     app.run_polling(
         drop_pending_updates=True,
-        allowed_updates=["message", "edited_message"],
+        allowed_updates=["message", "edited_message", "chat_member"],
     )
 
 
 if __name__ == "__main__":
     main()
-
