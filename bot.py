@@ -148,23 +148,52 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Risponde in General
         await message.reply_text(routing["sophia_reply"], parse_mode=ParseMode.MARKDOWN)
 
-        # Se ha trovato un agente, gira la domanda nel topic giusto
+        # Se ha trovato un agente, lo chiama direttamente e manda la risposta nel topic
         if routing["agent"] and routing["topic_id"] and GROUP_CHAT_ID:
-            agent_msg = sophia_format_agent_message(
-                routing["agent"],
-                routing["rephrased_question"],
-                user_name
-            )
+            agent      = routing["agent"]
+            topic_id   = routing["topic_id"]
+            sub_q      = routing["rephrased_question"]
+            intro      = sophia_format_agent_message(agent, sub_q, user_name)
+
             try:
+                # Annuncio nel topic ("Sophia gira la domanda a...")
                 await context.bot.send_message(
                     chat_id=GROUP_CHAT_ID,
-                    message_thread_id=routing["topic_id"],
-                    text=agent_msg,
+                    message_thread_id=topic_id,
+                    text=intro,
                     parse_mode=ParseMode.MARKDOWN,
                 )
-                logger.info(f"Sophia → {routing['agent']} (topic {routing['topic_id']})")
+
+                # Esegue l'agente reale e posta la risposta nello stesso topic
+                await context.bot.send_chat_action(chat_id=GROUP_CHAT_ID, action=ChatAction.TYPING)
+
+                if agent == "giorgio":
+                    city = await extract_city(sub_q)
+                    if city:
+                        answer = await giorgio_forecast(city, hours=8)
+                    else:
+                        answer = "🌍 Non ho trovato la città nella domanda."
+                    await context.bot.send_message(
+                        chat_id=GROUP_CHAT_ID,
+                        message_thread_id=topic_id,
+                        text=answer,
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+
+                elif agent == "luca":
+                    answer = await luca_answer_question(sub_q)
+                    await context.bot.send_message(
+                        chat_id=GROUP_CHAT_ID,
+                        message_thread_id=topic_id,
+                        text=answer,
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+
+                logger.info(f"Sophia → {agent} (topic {topic_id}) ✅")
+
             except Exception as e:
-                logger.error(f"Errore invio al topic {routing['topic_id']}: {e}")
+                logger.error(f"Errore Sophia→{agent}: {e}", exc_info=True)
+
         return
 
     emoji = TOPIC_EMOJI.get(topic, "💬")
