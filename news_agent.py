@@ -301,7 +301,7 @@ async def fetch_recent_news(max_items: int = 20) -> list[dict]:
 async def luca_news_summary(news_items: list[dict], hours: int = 4) -> str:
     """
     Luca fa un sunto delle ultime N ore di notizie su multiplayer.it.
-    Chiamato dal comando /news on-demand.
+    Restituisce un messaggio con il sunto senza link individuali.
     """
     if not news_items:
         return (
@@ -312,11 +312,6 @@ async def luca_news_summary(news_items: list[dict], hours: int = 4) -> str:
 
     news_list = "\n".join(
         f"{i+1}. {item['title']}" for i, item in enumerate(news_items[:15])
-    )
-
-    links = "\n".join(
-        f"• [{item['title'][:60]}]({item['url']})"
-        for item in news_items[:8]
     )
 
     system = f"""{SOUL_LUCA}
@@ -331,9 +326,10 @@ Struttura OBBLIGATORIA:
 Inizia con: 🎮 *Ultime {hours} ore su Multiplayer.it*
 
 Tono: diretto, critico, come faresti in una chat veloce con un collega.
-Lunghezza: 150-250 parole. Scrivi in italiano. Usa *grassetto* per i titoli."""
+Lunghezza: 150-250 parole. Scrivi in italiano. Usa *grassetto* per i titoli.
+NON includere link o URL nel testo."""
 
-    summary = await call_llm(
+    return await call_llm(
         system=system,
         messages=[{
             "role": "user",
@@ -341,8 +337,6 @@ Lunghezza: 150-250 parole. Scrivi in italiano. Usa *grassetto* per i titoli."""
         }],
         max_tokens=500,
     )
-
-    return f"{summary}\n\n{links}"
 
 
 # ── FORMATTAZIONE ─────────────────────────────────────────────────────────────

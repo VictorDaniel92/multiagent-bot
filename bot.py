@@ -28,6 +28,7 @@ TOPIC_MAP = {
     4:    "coding",
     6:    "brainstorming",
     8:    "analisi",
+    57:   "news",
     # ⬇ Crea il topic "News" nel gruppo e metti qui il suo thread_id
     # Puoi trovarlo nei log dopo aver mandato un messaggio in quel topic
     # Esempio: 10: "news",
@@ -384,21 +385,23 @@ async def post_init(app):
     ])
 
     # ── Job: controlla news ogni 30 minuti ────────────────────────────────────
-    app.job_queue.run_repeating(
-        job_check_news,
-        interval=1800,   # 30 minuti
-        first=30,        # primo check dopo 30 secondi dall'avvio
-        name="check_news",
-    )
-
-    # ── Job: digest mattutino alle 9:00 (ora italiana = UTC+2 in estate) ─────
-    app.job_queue.run_daily(
-        job_daily_digest,
-        time=datetime.time(7, 0, 0),  # 07:00 UTC = 09:00 CEST
-        name="daily_digest",
-    )
-
-    logger.info("Job news schedulati ✅")
+    # Parte solo se ENABLE_NEWS_JOB=true nelle variabili Railway
+    if os.environ.get("ENABLE_NEWS_JOB", "false").lower() == "true":
+        app.job_queue.run_repeating(
+            job_check_news,
+            interval=1800,   # 30 minuti
+            first=60,        # primo check dopo 1 minuto dall'avvio
+            name="check_news",
+        )
+        # ── Job: digest mattutino alle 9:00 (ora italiana = UTC+2 in estate) ─────
+        app.job_queue.run_daily(
+            job_daily_digest,
+            time=datetime.time(7, 0, 0),  # 07:00 UTC = 09:00 CEST
+            name="daily_digest",
+        )
+        logger.info("Job news schedulati ✅")
+    else:
+        logger.info("Job news disabilitati (ENABLE_NEWS_JOB != true)")
 
 
 def main():
@@ -426,3 +429,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
