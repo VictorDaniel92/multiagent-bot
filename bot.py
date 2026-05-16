@@ -76,6 +76,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id  = update.effective_user.id
     chat_id  = update.effective_chat.id
     topic    = get_topic(update)
+    logger.info(f"Messaggio da topic thread_id={getattr(update.message, 'message_thread_id', None)}, topic={topic}")
     emoji    = TOPIC_EMOJI.get(topic, "💬")
 
     # Carica la memoria utente per iniettarla nel contesto
