@@ -78,7 +78,7 @@ TOPIC_EMOJI = {
 def get_topic(update: Update) -> str:
     thread_id = getattr(update.message, "message_thread_id", None)
     topic = TOPIC_MAP.get(thread_id, "ricerca")
-    logger.info(f"[MSG] thread_id={thread_id} → topic={topic}")
+    logger.info(f"[MSG] thread_id={thread_id} → topic={topic} | user_id={update.effective_user.id}")
     return topic
 
 
