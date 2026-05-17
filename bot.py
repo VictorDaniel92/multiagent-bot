@@ -56,6 +56,12 @@ from user_profiles import (
     init_profiles_db, get_profile, auto_update_profile,
     format_profile_for_prompt, sophia_parse_profile_declaration,
 )
+from agent_state import (
+    init_agent_state_db, get_agent_state, save_agent_state,
+    build_agent_context, update_perspective, update_mood,
+    increment_interaction, extract_goals_from_message, add_goal,
+    set_shared_state, mood_label,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -331,13 +337,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
             profile     = await get_profile(user_id)
             profile_ctx = format_profile_for_prompt(profile)
-            answer = await luca_answer_question(question, profile_context=profile_ctx)
+
+            # Contesto di stato di Luca
+            luca_ctx = await build_agent_context("luca", user_id)
+            new_goals = await extract_goals_from_message("luca", question)
+            for goal in new_goals:
+                await add_goal("luca", user_id, goal)
+
+            answer = await luca_answer_question(
+                question, profile_context=profile_ctx + "\n\n" + luca_ctx
+            )
             await status_msg.delete()
             await message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
             mark_message_answered(message.message_id)
             await save_conversation(user_id=user_id, topic="news", agent="luca",
                                     question=question, answer=answer)
             await add_agent_message(user_id, "news", answer[:300], agent="luca")
+
+            # Aggiorna stato Luca (silenzioso)
+            async def _update_luca_state():
+                await increment_interaction("luca", user_id)
+                state = await get_agent_state("luca", user_id)
+                new_perspective = await update_perspective(
+                    "luca", user_id, state["perspective"],
+                    f"D: {question[:200]}\nR: {answer[:300]}",
+                )
+                await save_agent_state("luca", user_id, perspective=new_perspective)
+                await set_shared_state("luca",
+                    current_focus="notizie gaming / multiplayer.it",
+                    recent_insight=answer[:120],
+                )
+                await update_mood("luca", user_id, delta=+0.02)
+            asyncio.ensure_future(_update_luca_state())
+
             if os.environ.get("ENABLE_CROSS_AGENT", "false").lower() == "true":
                 asyncio.create_task(sophia_check_cross_agent_link(
                     context.bot, GROUP_CHAT_ID, "luca", "news", question, answer
@@ -465,11 +497,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if episode_pattern:
         memory_context += f"\n\n## Pattern comportamentali recenti\n{episode_pattern}"
 
+    # ── STATO AGENTE ──────────────────────────────────────────────────────
+    agent_context = await build_agent_context("alex", user_id)
+    # Estrai eventuali obiettivi dal messaggio e salvali
+    new_goals = await extract_goals_from_message("alex", question)
+    for goal in new_goals:
+        await add_goal("alex", user_id, goal)
+    # ─────────────────────────────────────────────────────────────────────
+
     status_msg = await message.reply_text(f"⏳ Avvio pipeline {emoji}...")
 
     try:
         result = await run_pipeline_with_updates(
-            question, topic, memory_context, status_msg, context.bot, chat_id
+            question, topic, memory_context, status_msg, context.bot, chat_id,
+            agent_context=agent_context,
         )
         await status_msg.delete()
 
@@ -493,8 +534,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Traccia la risposta nella sessione episodica
         await add_agent_message(user_id, topic, result["answer"][:300], agent="alex")
 
-        # Aggiornamento automatico profilo (silenzioso, non blocca)
+        # ── AGGIORNA STATO AGENTE ─────────────────────────────────────────
         import asyncio as _asyncio
+        async def _update_alex_state():
+            # Incrementa contatore
+            await increment_interaction("alex", user_id)
+            # Aggiorna prospettiva sull'utente
+            state = await get_agent_state("alex", user_id)
+            new_perspective = await update_perspective(
+                "alex", user_id,
+                state["perspective"],
+                f"D: {question[:200]}\nR: {result['answer'][:300]}",
+            )
+            await save_agent_state("alex", user_id, perspective=new_perspective)
+            # Aggiorna stato condiviso
+            await set_shared_state(
+                "alex",
+                current_focus=topic,
+                recent_insight=result["answer"][:120],
+            )
+            # Mood: leggero boost per ogni interazione completata
+            await update_mood("alex", user_id, delta=+0.02)
+
+        _asyncio.ensure_future(_update_alex_state())
+        # ─────────────────────────────────────────────────────────────────
+
+        # Aggiornamento automatico profilo (silenzioso, non blocca)
         _asyncio.ensure_future(
             auto_update_profile(user_id, update.effective_user.first_name, question, topic)
         )
@@ -507,7 +572,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text("⚠️ Errore. Riprova tra qualche secondo.")
 
 
-async def run_pipeline_with_updates(question, topic, memory_context, status_msg, bot, chat_id):
+async def run_pipeline_with_updates(question, topic, memory_context, status_msg, bot, chat_id, agent_context=""):
     from agents import max_plan, sofia_synthesize, alex_answer
 
     await status_msg.edit_text("🎯 *Max* sta pianificando...", parse_mode=ParseMode.MARKDOWN)
@@ -524,7 +589,7 @@ async def run_pipeline_with_updates(question, topic, memory_context, status_msg,
 
     await status_msg.edit_text("✍️ *Alex* sta scrivendo...", parse_mode=ParseMode.MARKDOWN)
     await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-    answer = await alex_answer(question, queries, briefing, topic, memory_context)
+    answer = await alex_answer(question, queries, briefing, topic, memory_context, agent_context)
 
     return {"queries": queries, "briefing": briefing, "answer": answer, "topic": topic}
 
@@ -974,6 +1039,7 @@ async def post_init(app):
     await init_vector_db()
     await init_profiles_db()
     await init_episode_db()
+    await init_agent_state_db()
 
     # Avvia il server webhook in parallelo
     set_bot_app(app)

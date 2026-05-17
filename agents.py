@@ -285,7 +285,8 @@ async def alex_answer(
     max_queries: list[str],
     sofia_briefing: str,
     topic: str = "default",
-    memory_context: str = ""
+    memory_context: str = "",
+    agent_context: str = "",    # ← stato individuale + colleghi
 ) -> str:
     """
     Alex produce la risposta finale per l'utente.
@@ -296,6 +297,8 @@ async def alex_answer(
     system = f"""{SOUL_ALEX}
 
 {memory_context}
+
+{agent_context}
 
 ## Stile per questo topic
 {config['alex_style']}
@@ -320,7 +323,12 @@ Briefing di Sofia:
 
 # ── PIPELINE COMPLETO ─────────────────────────────────────────────────────────
 
-async def run_pipeline(user_question: str, topic: str = "default", memory_context: str = "") -> dict:
+async def run_pipeline(
+    user_question: str,
+    topic: str = "default",
+    memory_context: str = "",
+    agent_context: str = "",    # ← passa il contesto di stato dal bot
+) -> dict:
     """
     Esegue Max → Sofia → Alex con la configurazione del topic corretto.
     """
@@ -331,7 +339,9 @@ async def run_pipeline(user_question: str, topic: str = "default", memory_contex
     else:
         briefing = "Nessuna ricerca eseguita — risposta basata sulla conoscenza interna."
 
-    answer = await alex_answer(user_question, queries, briefing, topic, memory_context)
+    answer = await alex_answer(
+        user_question, queries, briefing, topic, memory_context, agent_context
+    )
 
     return {
         "queries":  queries,
