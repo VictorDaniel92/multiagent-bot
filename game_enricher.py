@@ -44,9 +44,16 @@ class GameData:
     multiplayer_review_text: str = ""  # testo recensione completo
     hltb_main:        str = ""   # "30 ore"    o ""
     hltb_complete:    str = ""   # "80 ore"    o ""
+    # PSN — dati base dalla lista trofei
     psn_difficulty:   str = ""   # "4/10"      o ""
     psn_completion:   str = ""   # "3.5%"      o ""
     psn_url:          str = ""
+    # PSN — dati dalla guida
+    psn_guide_url:        str  = ""
+    psn_time_to_plat:     str  = ""   # "40-50 ore"
+    psn_playthroughs:     str  = ""   # "2"
+    psn_missable:         str  = ""   # "Sì (3)" / "No"
+    psn_guide_difficulty: str  = ""   # "4/10"  (dalla guida, più preciso)
     errors:    list[str] = field(default_factory=list)
 
     def has_data(self) -> bool:
@@ -55,6 +62,7 @@ class GameData:
             self.multiplayer_vote,
             self.hltb_main,
             self.psn_difficulty,
+            self.psn_guide_url,
         ])
 
     def format_for_telegram(self) -> str:
@@ -65,7 +73,7 @@ class GameData:
         lines = [f"\n{'─' * 28}", f"📋 *{self.name}*\n"]
 
         if self.metacritic_score or self.metacritic_user:
-            mc = self.metacritic_score or "n/d"
+            mc  = self.metacritic_score or "n/d"
             usr = f" | utenti: {self.metacritic_user}" if self.metacritic_user else ""
             lines.append(f"🟡 *Metacritic:* {mc}{usr}")
 
@@ -78,11 +86,27 @@ class GameData:
             completo = self.hltb_complete or "n/d"
             lines.append(f"⏱ *HowLongToBeat:* storia {storia} | 100% {completo}")
 
-        if self.psn_difficulty or self.psn_completion:
-            diff = self.psn_difficulty or "n/d"
-            comp = f" | completato {self.psn_completion}" if self.psn_completion else ""
-            url  = f" — [profilo]({self.psn_url})" if self.psn_url else ""
-            lines.append(f"🏆 *Platino:* difficoltà {diff}{comp}{url}")
+        # Sezione platino — preferisce dati guida se disponibili
+        has_plat = any([
+            self.psn_guide_url, self.psn_difficulty, self.psn_guide_difficulty,
+            self.psn_time_to_plat, self.psn_playthroughs, self.psn_missable,
+        ])
+        if has_plat:
+            lines.append("")
+            guide_link = f"[📖 Guida Platino]({self.psn_guide_url})" if self.psn_guide_url else "🏆 *Platino*"
+            lines.append(guide_link)
+
+            diff = self.psn_guide_difficulty or self.psn_difficulty
+            if diff:
+                lines.append(f"  • Difficoltà: *{diff}*")
+            if self.psn_time_to_plat:
+                lines.append(f"  • Tempo stimato: *{self.psn_time_to_plat}*")
+            if self.psn_playthroughs:
+                lines.append(f"  • Playthrough necessari: *{self.psn_playthroughs}*")
+            if self.psn_missable:
+                lines.append(f"  • Trofei missabili: *{self.psn_missable}*")
+            if self.psn_completion:
+                lines.append(f"  • Platinato da: {self.psn_completion} dei giocatori")
 
         return "\n".join(lines)
 
@@ -327,8 +351,8 @@ async def fetch_hltb(client: httpx.AsyncClient, game_name: str, data: GameData):
 
 async def fetch_psnprofiles(client: httpx.AsyncClient, game_name: str, data: GameData):
     """
-    Recupera difficoltà platino e tasso di completamento da PSNProfiles.
-    URL: https://psnprofiles.com/trophies?q={query}
+    Step 1: trova la lista trofei su PSNProfiles e recupera completion rate.
+    Step 2: cerca la guida al platino e ne estrae i dettagli.
     """
     query = game_name.replace(" ", "+")
     url   = f"https://psnprofiles.com/trophies?q={query}"
@@ -340,50 +364,147 @@ async def fetch_psnprofiles(client: httpx.AsyncClient, game_name: str, data: Gam
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Primo risultato della lista trofei
+    # ── Trova URL lista trofei ─────────────────────────────────────────────
+    game_url = None
     first = soup.find("li", class_=re.compile(r"game-item|title-item")) \
           or soup.select_one("#games-list li, table.zebra tr:not(:first-child)")
 
-    if not first:
-        # Prova link diretto alla pagina del gioco
-        game_link = soup.find("a", href=re.compile(r"/trophies/\d+"))
-        if not game_link:
-            logger.debug(f"PSNProfiles: nessun risultato per '{game_name}'")
-            return
-        game_url = "https://psnprofiles.com" + game_link["href"]
-    else:
+    if first:
         link = first.find("a", href=re.compile(r"/trophies/"))
-        if not link:
-            return
-        game_url = "https://psnprofiles.com" + link["href"]
+        if link:
+            game_url = "https://psnprofiles.com" + link["href"]
+    else:
+        game_link = soup.find("a", href=re.compile(r"/trophies/\d+"))
+        if game_link:
+            game_url = "https://psnprofiles.com" + game_link["href"]
 
-    # Apri la pagina del gioco
-    resp2 = await _get(client, game_url)
+    if game_url:
+        data.psn_url = game_url
+        # Recupera completion rate dalla pagina trofei
+        resp2 = await _get(client, game_url)
+        if resp2:
+            soup2 = BeautifulSoup(resp2.text, "html.parser")
+            for el in soup2.find_all(string=re.compile(r"Platinum|completat", re.I)):
+                parent = el.parent
+                if parent:
+                    m = re.search(r"(\d+(?:\.\d+)?)\s*%", parent.get_text())
+                    if m:
+                        data.psn_completion = f"{m.group(1)}%"
+                        break
+
+    # ── Step 2: cerca la guida al platino ─────────────────────────────────
+    await _fetch_psn_guide(client, game_name, data)
+
+    logger.debug(f"PSNProfiles: {game_name} → diff={data.psn_guide_difficulty}, "
+                 f"time={data.psn_time_to_plat}, missable={data.psn_missable}")
+
+
+async def _fetch_psn_guide(client: httpx.AsyncClient, game_name: str, data: GameData):
+    """
+    Cerca e scrapa la guida al platino su PSNProfiles.
+    Le guide hanno URL tipo: https://psnprofiles.com/guide/XXXX-game-name
+    e contengono una tabella con: difficulty, time, playthroughs, missable trophies.
+    """
+    # Cerca la guida
+    query    = game_name.replace(" ", "+")
+    guide_search = f"https://psnprofiles.com/guides?q={query}"
+
+    resp = await _get(client, guide_search)
+    if not resp:
+        return
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Trova il primo link a una guida
+    guide_url = None
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/guide/" in href and href != "/guides":
+            guide_url = ("https://psnprofiles.com" + href) if href.startswith("/") else href
+            break
+
+    if not guide_url:
+        logger.debug(f"PSNProfiles: nessuna guida trovata per '{game_name}'")
+        return
+
+    data.psn_guide_url = guide_url
+
+    # Scrapa la guida
+    resp2 = await _get(client, guide_url)
     if not resp2:
         return
 
     soup2 = BeautifulSoup(resp2.text, "html.parser")
 
-    # Difficoltà platino (spesso in un tag con "difficulty" o "Platinum Difficulty")
-    diff_el = soup2.find(class_=re.compile(r"difficulty", re.I)) \
-           or soup2.find(string=re.compile(r"Platinum Difficulty", re.I))
-    if diff_el:
-        parent = diff_el.parent if isinstance(diff_el, str) else diff_el
-        m = re.search(r"(\d+(?:\.\d+)?)\s*/\s*10", parent.get_text())
-        if m:
-            data.psn_difficulty = f"{m.group(1)}/10"
+    # Le guide PSNProfiles hanno una tabella "overview" con righe tipo:
+    # "Estimated trophy difficulty" | "4/10"
+    # "Approximate amount of time"  | "40-50 hours"
+    # "Minimum number of playthroughs" | "2"
+    # "Number of missable trophies" | "3" oppure "None"
+    # "Online trophies"             | "0"
 
-    # Tasso di completamento (% di utenti che hanno il platino)
-    for el in soup2.find_all(string=re.compile(r"Platinum|completat", re.I)):
-        parent = el.parent
-        if parent:
-            m = re.search(r"(\d+(?:\.\d+)?)\s*%", parent.get_text())
-            if m:
-                data.psn_completion = f"{m.group(1)}%"
-                break
+    # Mappa campi → attributo GameData
+    field_map = {
+        r"difficulty":      "psn_guide_difficulty",
+        r"time.*plat|hours.*plat|approximate.*time": "psn_time_to_plat",
+        r"playthrough":     "psn_playthroughs",
+        r"missable":        "psn_missable",
+    }
 
-    data.psn_url = game_url
-    logger.debug(f"PSNProfiles: {game_name} → {data.psn_difficulty}, {data.psn_completion}")
+    # Cerca nella tabella overview
+    for row in soup2.find_all("tr"):
+        cells = row.find_all(["td", "th"])
+        if len(cells) < 2:
+            continue
+        label = cells[0].get_text(" ", strip=True).lower()
+        value = cells[1].get_text(" ", strip=True)
+
+        for pattern, attr in field_map.items():
+            if re.search(pattern, label, re.I) and value and not getattr(data, attr):
+                # Normalizza tempo in italiano
+                if attr == "psn_time_to_plat":
+                    value = _normalize_time(value)
+                # Normalizza missable
+                if attr == "psn_missable":
+                    value = _normalize_missable(value)
+                setattr(data, attr, value)
+
+    # Fallback: cerca come lista di definizioni <dt>/<dd>
+    if not data.psn_guide_difficulty:
+        for dt in soup2.find_all("dt"):
+            label = dt.get_text(strip=True).lower()
+            dd    = dt.find_next_sibling("dd")
+            if not dd:
+                continue
+            value = dd.get_text(strip=True)
+            for pattern, attr in field_map.items():
+                if re.search(pattern, label, re.I) and value and not getattr(data, attr):
+                    if attr == "psn_time_to_plat":
+                        value = _normalize_time(value)
+                    if attr == "psn_missable":
+                        value = _normalize_missable(value)
+                    setattr(data, attr, value)
+
+    logger.debug(f"PSN Guide: {game_name} → {data.psn_guide_url} | "
+                 f"diff={data.psn_guide_difficulty} time={data.psn_time_to_plat} "
+                 f"miss={data.psn_missable} play={data.psn_playthroughs}")
+
+
+def _normalize_time(value: str) -> str:
+    """Converte '40-50 hours' → '40-50 ore'."""
+    value = re.sub(r"\bhours?\b", "ore", value, flags=re.I)
+    value = re.sub(r"\bminutes?\b", "min", value, flags=re.I)
+    return value.strip()
+
+
+def _normalize_missable(value: str) -> str:
+    """Converte 'None' → 'No', numeri → 'Sì (N)'."""
+    v = value.strip()
+    if v.lower() in ("none", "0", "no"):
+        return "No"
+    if v.isdigit() and int(v) > 0:
+        return f"Sì ({v})"
+    return v
 
 
 # ── SCRAPER 5: TESTO RECENSIONE MULTIPLAYER.IT ───────────────────────────────

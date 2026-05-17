@@ -1,3 +1,4 @@
+import re
 import asyncio
 import logging
 from pathlib import Path
@@ -391,27 +392,30 @@ async def luca_answer_question(question: str, profile_context: str = "") -> str:
     """
     Luca risponde a una domanda libera nel topic news.
     Se la domanda riguarda un gioco specifico, arricchisce la risposta
-    con dati da Metacritic, Multiplayer.it, HowLongToBeat e PSNProfiles,
-    e usa il testo della recensione di Multiplayer.it come contesto.
+    con dati da Metacritic, Multiplayer.it, HowLongToBeat e PSNProfiles.
+    Se la domanda riguarda il platino, mostra la guida dettagliata.
     """
     from game_enricher import detect_game_name, enrich_game_data
 
-    # Rilevamento gioco e risposta base in parallelo
+    # Rileva se è una domanda sul platino
+    is_platinum_question = bool(re.search(
+        r'\b(platino|platinum|trofei|trophy|trophies|missabili?|playthrough|completare al 100)\b',
+        question, re.I
+    ))
+
     game_name, _ = await asyncio.gather(
         detect_game_name(question),
-        asyncio.sleep(0),  # placeholder per gather
+        asyncio.sleep(0),
     )
 
-    # Se c'è un gioco specifico, arricchisce prima di rispondere
     review_context = ""
     stats_block    = ""
 
     if game_name:
-        logger.info(f"Luca: arricchimento dati per '{game_name}'")
+        logger.info(f"Luca: arricchimento dati per '{game_name}' (platinum={is_platinum_question})")
         game_data = await enrich_game_data(game_name)
         stats_block = game_data.format_for_telegram()
 
-        # Inietta il testo della recensione come contesto per il LLM
         if game_data.multiplayer_review_text:
             review_context = (
                 f"\n\n## Recensione di Multiplayer.it per {game_name}:\n"
@@ -419,6 +423,10 @@ async def luca_answer_question(question: str, profile_context: str = "") -> str:
                 f"Usa questa recensione come base per la tua risposta — "
                 f"puoi citare aspetti specifici, concordare o dissentire con giudizio critico."
             )
+
+        # Risposta dedicata al platino
+        if is_platinum_question and game_data.psn_guide_url:
+            return await _luca_platinum_answer(question, game_name, game_data, profile_context)
 
     system = f"""{SOUL_LUCA}
 
@@ -441,6 +449,46 @@ Regole:
         max_tokens=350,
     )
 
+    return answer + (stats_block if stats_block else "")
+
+
+async def _luca_platinum_answer(question: str, game_name: str, game_data, profile_context: str) -> str:
+    """Risposta dedicata alle domande sul platino, con dati dalla guida PSNProfiles."""
+
+    # Costruisce contesto guida
+    guide_lines = []
+    if game_data.psn_guide_difficulty:
+        guide_lines.append(f"Difficoltà: {game_data.psn_guide_difficulty}")
+    if game_data.psn_time_to_plat:
+        guide_lines.append(f"Tempo stimato: {game_data.psn_time_to_plat}")
+    if game_data.psn_playthroughs:
+        guide_lines.append(f"Playthrough necessari: {game_data.psn_playthroughs}")
+    if game_data.psn_missable:
+        guide_lines.append(f"Trofei missabili: {game_data.psn_missable}")
+    if game_data.psn_completion:
+        guide_lines.append(f"Platinato da: {game_data.psn_completion} dei giocatori")
+
+    guide_context = "\n".join(guide_lines) if guide_lines else "Dati non disponibili"
+
+    system = f"""{SOUL_LUCA}
+
+{profile_context}
+
+Stai rispondendo a una domanda sul platino di un gioco.
+Hai i dati della guida ufficiale su PSNProfiles — usali per dare una risposta precisa e utile.
+Aggiungi il tuo commento personale: vale la pena farlo? È frustrante o godibile?
+Max 4 frasi + i dati. Scrivi in italiano. Formato Telegram."""
+
+    answer = await call_llm(
+        system=system,
+        messages=[{"role": "user", "content":
+            f"Domanda: {question}\n\nDati guida per {game_name}:\n{guide_context}"
+        }],
+        max_tokens=300,
+    )
+
+    # Appende sempre il blocco dati completo con link alla guida
+    stats_block = game_data.format_for_telegram()
     return answer + (stats_block if stats_block else "")
 
 
