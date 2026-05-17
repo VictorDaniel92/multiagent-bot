@@ -390,56 +390,67 @@ async def fetch_psnprofiles(client: httpx.AsyncClient, game_name: str, data: Gam
 
 
 async def _scrape_psn_guide(client: httpx.AsyncClient, guide_url: str, data: GameData):
-    """Scrapa la pagina della guida per estrarre difficoltà, tempo, playthrough, missabili."""
-    resp = await _get(client, guide_url)
-    if not resp:
-        logger.info(f"PSN Guide: impossibile scrapare {guide_url}")
+    """
+    PSNProfiles blocca lo scraping con 403.
+    Usa Serper per cercare i dati della guida direttamente dai snippet Google.
+    """
+    from search import web_search, format_results
+
+    game_name = data.name
+
+    # Cerca i dati della guida tramite Google
+    queries = [
+        f'psnprofiles "{game_name}" trophy guide difficulty time playthroughs missable',
+        f'"{game_name}" platinum trophy guide missable trophies playthroughs hours',
+    ]
+
+    all_snippets = []
+    for q in queries:
+        results = await asyncio.get_event_loop().run_in_executor(
+            None, lambda q=q: web_search(q, max_results=4)
+        )
+        all_snippets.extend(results)
+
+    if not all_snippets:
+        logger.info("PSN Guide: nessun snippet trovato via Serper")
         return
 
-    logger.info(f"PSN Guide HTTP {resp.status_code} — primi 800 chars: {resp.text[:800]!r}")
+    snippets_text = format_results(all_snippets)
+    logger.info(f"PSN Guide snippets trovati: {len(all_snippets)}")
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    # Usa il LLM per estrarre i dati strutturati dagli snippet
+    raw = await call_llm(
+        system="""Sei un estrattore di dati da testi su guide di trofei PlayStation.
+Estrai le informazioni dalla guida al platino e rispondi SOLO con JSON valido:
+{
+  "difficulty": "X/10 o stringa descrittiva o null",
+  "time": "X-Y ore o null",
+  "playthroughs": "numero o null",
+  "missable": "Sì (N) o No o null"
+}
+Se un dato non è presente nei testi, metti null.
+Non inventare dati non presenti.""",
+        messages=[{"role": "user", "content":
+            f"Gioco: {game_name}\n\nTesti trovati:\n{snippets_text[:3000]}"
+        }],
+        max_tokens=150,
+    )
 
-    field_map = {
-        r"difficulty":                   "psn_guide_difficulty",
-        r"time.*plat|approximate.*time": "psn_time_to_plat",
-        r"playthrough":                  "psn_playthroughs",
-        r"missable":                     "psn_missable",
-    }
-
-    for row in soup.find_all("tr"):
-        cells = row.find_all(["td", "th"])
-        if len(cells) < 2:
-            continue
-        label = cells[0].get_text(" ", strip=True).lower()
-        value = cells[1].get_text(" ", strip=True)
-        if not value:
-            continue
-        for pattern, attr in field_map.items():
-            if re.search(pattern, label, re.I) and not getattr(data, attr):
-                if attr == "psn_time_to_plat":
-                    value = _normalize_time(value)
-                if attr == "psn_missable":
-                    value = _normalize_missable(value)
-                setattr(data, attr, value)
-
-    if not data.psn_guide_difficulty:
-        for dt in soup.find_all("dt"):
-            label = dt.get_text(strip=True).lower()
-            dd    = dt.find_next_sibling("dd")
-            if not dd:
-                continue
-            value = dd.get_text(strip=True)
-            for pattern, attr in field_map.items():
-                if re.search(pattern, label, re.I) and value and not getattr(data, attr):
-                    if attr == "psn_time_to_plat":
-                        value = _normalize_time(value)
-                    if attr == "psn_missable":
-                        value = _normalize_missable(value)
-                    setattr(data, attr, value)
-
-    logger.info(f"PSN Guide scraped: diff={data.psn_guide_difficulty} "
-                f"time={data.psn_time_to_plat} miss={data.psn_missable} play={data.psn_playthroughs}")
+    import json
+    try:
+        extracted = json.loads(re.search(r'\{.*\}', raw, re.DOTALL).group())
+        if extracted.get("difficulty"):
+            data.psn_guide_difficulty = extracted["difficulty"]
+        if extracted.get("time"):
+            data.psn_time_to_plat = _normalize_time(extracted["time"])
+        if extracted.get("playthroughs"):
+            data.psn_playthroughs = extracted["playthroughs"]
+        if extracted.get("missable"):
+            data.psn_missable = extracted["missable"]
+        logger.info(f"PSN Guide estratto: diff={data.psn_guide_difficulty} "
+                    f"time={data.psn_time_to_plat} miss={data.psn_missable} play={data.psn_playthroughs}")
+    except Exception as e:
+        logger.error(f"PSN Guide parsing errore: {e} — raw: {raw[:200]}")
 
 
 def _normalize_time(value: str) -> str:
