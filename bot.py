@@ -1,5 +1,6 @@
 import os
 import re
+import asyncio
 import logging
 import datetime
 from telegram import Update, BotCommand, ChatMemberUpdated
@@ -27,6 +28,11 @@ from memory_vector import (
     get_recent_conversations,
 )
 from webhook_server import start_webhook_server, set_bot_app
+from sophia_orchestrator import (
+    store_weather_briefing, sophia_check_weather_contradiction,
+    sophia_check_cross_agent_link, sophia_check_unanswered,
+    track_incoming_message, mark_message_answered,
+)
 from sophia_agent import (
     sophia_is_mentioned, sophia_route_request, sophia_format_agent_message,
     sophia_welcome, sophia_daily_recap, sophia_agent_status,
@@ -115,6 +121,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Logga attività per il recap serale
     sophia_log_activity(topic)
+
+    # Traccia il messaggio come "in attesa di risposta" (per orchestratore)
+    if topic != "general":
+        track_incoming_message(
+            message.message_id, question, topic, thread_id, chat_id
+        )
 
     # ── GENERAL — Solo Sophia, solo se menzionata ──────────────────────────
     if topic == "general":
@@ -262,8 +274,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             answer = await luca_answer_question(question)
             await status_msg.delete()
             await message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
+            mark_message_answered(message.message_id)
             await save_conversation(user_id=user_id, topic="news", agent="luca",
                                     question=question, answer=answer)
+            # Sophia valuta collegamento cross-agente
+            asyncio.create_task(sophia_check_cross_agent_link(
+                context.bot, GROUP_CHAT_ID, "luca", "news", question, answer
+            ))
         except Exception as e:
             logger.error(f"Errore Luca: {e}", exc_info=True)
             await status_msg.edit_text("⚠️ Errore. Riprova tra qualche secondo.")
@@ -306,6 +323,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             answer = await giorgio_forecast(city, hours=8)
             await status_msg.delete()
             await message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
+            mark_message_answered(message.message_id)
             await save_conversation(user_id=user_id, topic="meteo", agent="giorgio",
                                     question=question, answer=answer)
         except Exception as e:
@@ -345,8 +363,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             answer = await marco_answer_question(question)
             await status_msg.delete()
             await message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
+            mark_message_answered(message.message_id)
             await save_conversation(user_id=user_id, topic="viaggi", agent="marco",
                                     question=question, answer=answer)
+            # Sophia valuta collegamento cross-agente
+            asyncio.create_task(sophia_check_cross_agent_link(
+                context.bot, GROUP_CHAT_ID, "marco", "viaggi", question, answer
+            ))
         except Exception as e:
             logger.error(f"Errore Marco: {e}", exc_info=True)
             await status_msg.edit_text("⚠️ Errore. Riprova tra qualche secondo.")
@@ -539,6 +562,13 @@ async def job_morning_weather(context):
             chat_id=GROUP_CHAT_ID, message_thread_id=METEO_TOPIC_ID,
             text=briefing, parse_mode=ParseMode.MARKDOWN,
         )
+        # Salva briefing per il check contraddizioni di Sophia
+        for city in MORNING_CITIES:
+            store_weather_briefing(city["name"].lower(), briefing)
+        # Sophia controlla contraddizioni con ieri
+        asyncio.create_task(
+            sophia_check_weather_contradiction(context.bot, GROUP_CHAT_ID)
+        )
     except Exception as e:
         logger.error(f"Errore job meteo: {e}")
 
@@ -606,6 +636,13 @@ async def job_check_reminders(context):
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
+async def job_sophia_check_unanswered(context):
+    """Ogni 5 minuti Sophia controlla messaggi rimasti senza risposta."""
+    if not GROUP_CHAT_ID:
+        return
+    await sophia_check_unanswered(context.bot, GROUP_CHAT_ID)
+
+
 async def post_init(app):
     await init_db()
     await init_news_db()
@@ -639,6 +676,11 @@ async def post_init(app):
 
     # Promemoria sempre attivi
     app.job_queue.run_repeating(job_check_reminders, interval=60, first=30, name="reminders")
+
+    # Sophia orchestratore — messaggi senza risposta (ogni 5 minuti)
+    app.job_queue.run_repeating(
+        job_sophia_check_unanswered, interval=300, first=60, name="sophia_unanswered"
+    )
     logger.info("Bot inizializzato ✅")
 
 
