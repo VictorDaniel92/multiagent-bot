@@ -20,6 +20,7 @@ from news_agent import (
 from weather_agent import (
     extract_city, giorgio_forecast, giorgio_morning_briefing, MORNING_CITIES
 )
+from marco_agent import marco_answer_question
 from memory_vector import (
     init_vector_db, save_conversation,
     search_memories, format_memories_for_prompt,
@@ -45,8 +46,9 @@ TOPIC_MAP = {
     4:    "coding",
     6:    "brainstorming",
     8:    "analisi",
-    57:   "news",      # Topic News  (Luca)
-    99:   "meteo",     # Topic Meteo (Giorgio)
+    57:   "news",      # Topic News    (Luca)
+    99:   "meteo",     # Topic Meteo   (Giorgio)
+    209:  "viaggi",    # Topic Viaggi  (Marco)
 }
 
 GROUP_CHAT_ID:  int      = int(os.environ.get("GROUP_CHAT_ID", "0"))
@@ -61,6 +63,7 @@ TOPIC_EMOJI = {
     "analisi":       "📊",
     "news":          "🎮",
     "meteo":         "🌤️",
+    "viaggi":        "🗺️",
 }
 
 
@@ -86,6 +89,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"*Agenti specializzati:*\n"
         f"🎮 *Luca* — Gaming & News (topic News)\n"
         f"🌤️ *Giorgio* — Meteo (topic Meteo)\n"
+        f"🗺️ *Marco* — Viaggi & Itinerari (topic Viaggi)\n"
         f"🔍 *Max+Sofia+Alex* — Ricerca, Coding, Brainstorming, Analisi\n\n"
         f"*Comandi:*\n"
         f"/agenti — chi c'è nel gruppo\n"
@@ -211,6 +215,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         parse_mode=ParseMode.MARKDOWN,
                     )
 
+                elif agent == "marco":
+                    answer = await marco_answer_question(sub_q)
+                    await context.bot.send_message(
+                        chat_id=GROUP_CHAT_ID,
+                        message_thread_id=topic_id,
+                        text=answer,
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+
                 logger.info(f"Sophia → {agent} (topic {topic_id}) ✅")
 
             except Exception as e:
@@ -300,7 +313,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.edit_text("⚠️ Errore meteo. Riprova tra qualche secondo.")
         return
 
-    # ── TOPIC GUARD (ricerca, coding, brainstorming, analisi) ──────────────
+    # ── VIAGGI (Marco) ─────────────────────────────────────────────────────
+    if topic == "viaggi":
+        from agents import call_llm
+        import json as _json
+        guard_result = await call_llm(
+            system='Classificatore. La domanda riguarda viaggi, mete, itinerari, cosa fare/vedere/mangiare in una città? Rispondi SOLO con JSON: {"ok": true} oppure {"ok": false}',
+            messages=[{"role": "user", "content": f"Domanda: {question}"}],
+            max_tokens=20
+        )
+        try:
+            ok = _json.loads(guard_result.strip()).get("ok", True)
+        except Exception:
+            ok = True
+
+        if not ok:
+            await message.reply_text(
+                "🗺️ Questo topic è dedicato ai *viaggi*!\n\n"
+                "Chiedimi itinerari, mete, cosa vedere o mangiare in una città.\n"
+                "Per altre domande usa il topic giusto.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+
+        status_msg = await message.reply_text(
+            "🗺️ *Marco* sta costruendo il tuo itinerario...",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        try:
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            answer = await marco_answer_question(question)
+            await status_msg.delete()
+            await message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
+            await save_conversation(user_id=user_id, topic="viaggi", agent="marco",
+                                    question=question, answer=answer)
+        except Exception as e:
+            logger.error(f"Errore Marco: {e}", exc_info=True)
+            await status_msg.edit_text("⚠️ Errore. Riprova tra qualche secondo.")
+        return
     from agents import topic_guard
     guard = await topic_guard(question, topic)
     if not guard["match"]:
@@ -450,7 +500,8 @@ async def cmd_agenti(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🌸 *Sophia* — Receptionist (General)\n"
             "Ti smista verso l'agente giusto.\n\n"
             "🎮 *Luca* — Gaming & News (topic News)\n"
-            "🌤️ *Giorgio* — Meteo (topic Meteo)\n\n"
+            "🌤️ *Giorgio* — Meteo (topic Meteo)\n"
+            "🗺️ *Marco* — Viaggi & Itinerari (topic Viaggi)\n\n"
             "Nel gruppo ricerca/analisi:\n"
             "🎯 *Max* · 🔍 *Sofia* · ✍️ *Alex*",
             parse_mode=ParseMode.MARKDOWN

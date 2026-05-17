@@ -39,6 +39,15 @@ KNOWN_AGENTS = {
         "keywords":    ["gioco", "gaming", "videogioco", "ps5", "xbox", "nintendo",
                         "steam", "uscita", "recensione", "gameplay", "dlc", "patch"],
     },
+    "marco": {
+        "topic_id":    209,
+        "topic_name":  "viaggi",
+        "emoji":       "🗺️",
+        "description": "viaggi, itinerari, mete, cosa vedere, cosa mangiare, weekend",
+        "keywords":    ["viaggio", "viaggi", "itinerario", "vacanza", "weekend",
+                        "visitare", "città", "meta", "albergo", "volo", "partire",
+                        "cosa fare", "cosa vedere", "dove andare", "gita"],
+    },
 }
 
 def load_soul() -> str:
