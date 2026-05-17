@@ -1,6 +1,7 @@
 import re
 import asyncio
 import logging
+import datetime
 from pathlib import Path
 from datetime import date, timedelta
 
@@ -391,22 +392,28 @@ Regole:
 async def luca_answer_question(question: str, profile_context: str = "") -> str:
     """
     Luca risponde a una domanda libera nel topic news.
-    Se la domanda riguarda un gioco specifico, arricchisce la risposta
-    con dati da Metacritic, Multiplayer.it, HowLongToBeat e PSNProfiles.
-    Se la domanda riguarda il platino, mostra la guida dettagliata.
+    Cerca su Google per dati aggiornati, poi arricchisce con dati da
+    Metacritic, Multiplayer.it, HowLongToBeat e PSNProfiles.
     """
     from game_enricher import detect_game_name, enrich_game_data
+    from search import web_search, format_results
 
-    # Rileva se è una domanda sul platino
     is_platinum_question = bool(re.search(
         r'\b(platino|platinum|trofei|trophy|trophies|missabili?|playthrough|completare al 100)\b',
         question, re.I
     ))
 
-    game_name, _ = await asyncio.gather(
+    # Ricerca Google e rilevamento gioco in parallelo
+    search_query = f"{question} {datetime.date.today().year}"
+    game_name, search_results = await asyncio.gather(
         detect_game_name(question),
-        asyncio.sleep(0),
+        asyncio.get_event_loop().run_in_executor(None, lambda: web_search(search_query, max_results=4)),
     )
+
+    web_context = ""
+    if search_results:
+        formatted = format_results(search_results)
+        web_context = f"\n\n## Risultati ricerca aggiornati:\n{formatted}"
 
     review_context = ""
     stats_block    = ""
@@ -420,13 +427,11 @@ async def luca_answer_question(question: str, profile_context: str = "") -> str:
             review_context = (
                 f"\n\n## Recensione di Multiplayer.it per {game_name}:\n"
                 f"{game_data.multiplayer_review_text}\n\n"
-                f"Usa questa recensione come base per la tua risposta — "
-                f"puoi citare aspetti specifici, concordare o dissentire con giudizio critico."
+                f"Usa questa recensione come base per la tua risposta."
             )
 
-        # Risposta dedicata al platino
         if is_platinum_question and game_data.psn_guide_url:
-            return await _luca_platinum_answer(question, game_name, game_data, profile_context)
+            return await _luca_platinum_answer(question, game_name, game_data, profile_context, web_context)
 
     system = f"""{SOUL_LUCA}
 
@@ -434,14 +439,15 @@ async def luca_answer_question(question: str, profile_context: str = "") -> str:
 
 Un utente ti ha scritto nel topic news/videogiochi del canale Telegram.
 Rispondi come faresti in un editoriale: con competenza, opinioni nette e contesto.
+Usa i risultati di ricerca per dare informazioni aggiornate e accurate — non usare dati che sai essere vecchi.
 
 Regole:
-- Rispondi direttamente alla domanda senza preamboli
+- Rispondi direttamente senza preamboli
 - Se hai la recensione di Multiplayer.it, usala come base ma esprimi la TUA voce critica
-- Puoi fare riferimenti storici ad altri giochi o momenti dell'industria
+- Puoi fare riferimenti storici ad altri giochi
 - Lunghezza: 3-6 frasi, mai oltre
 - Formato Telegram: *grassetto* per titoli/nomi importanti
-- Scrivi in italiano{review_context}"""
+- Scrivi in italiano{review_context}{web_context}"""
 
     answer = await call_llm(
         system=system,
@@ -452,7 +458,7 @@ Regole:
     return answer + (stats_block if stats_block else "")
 
 
-async def _luca_platinum_answer(question: str, game_name: str, game_data, profile_context: str) -> str:
+async def _luca_platinum_answer(question: str, game_name: str, game_data, profile_context: str, web_context: str = "") -> str:
     """Risposta dedicata alle domande sul platino, con dati dalla guida PSNProfiles."""
 
     # Costruisce contesto guida
