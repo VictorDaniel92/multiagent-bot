@@ -193,19 +193,19 @@ PROVIDERS = [
         "name":    "Cerebras",
         "url":     "https://api.cerebras.ai/v1/chat/completions",
         "api_key": os.environ.get("CEREBRAS_API_KEY", ""),
-        "model":   "llama3.3-70b",   # nome corretto senza trattino dopo llama
+        "model":   "llama-3.3-70b",
     },
     {
-        "name":    "Together AI",
-        "url":     "https://api.together.xyz/v1/chat/completions",
-        "api_key": os.environ.get("TOGETHER_API_KEY", ""),
-        "model":   "meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
+        "name":    "HuggingFace",
+        "url":     "https://api-inference.huggingface.co/models/meta-llama/Llama-3.3-70B-Instruct/v1/chat/completions",
+        "api_key": os.environ.get("HUGGINGFACE_API_KEY", ""),
+        "model":   "meta-llama/Llama-3.3-70B-Instruct",
+        # Gratuito sempre, ma più lento (cold start possibile)
     },
 ]
 
 # Errori HTTP che giustificano il fallback al provider successivo
-# 404 incluso: può indicare modello non trovato su quel provider
-FALLBACK_STATUS_CODES = {404, 429, 500, 502, 503, 504}
+FALLBACK_STATUS_CODES = {402, 404, 429, 500, 502, 503, 504}
 
 
 # ── LLM BASE CON FALLBACK ─────────────────────────────────────────────────────

@@ -796,15 +796,32 @@ async def cmd_mentor_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_mentor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /mentor          → analizza tutti gli agenti
-    /mentor alex     → analizza solo Alex
-    /mentor alex 30  → analizza Alex sulle ultime 30 conversazioni
+    /mentor        → analizza l'agente del topic in cui viene scritto
+    /mentor alex   → forza un agente specifico
+    /mentor alex 30 → agente specifico con N conversazioni
     """
+    # Mappa topic → agente di default
+    TOPIC_TO_AGENT = {
+        "news":          "luca",
+        "meteo":         "giorgio",
+        "viaggi":        "marco",
+        "ricerca":       "alex",
+        "coding":        "alex",
+        "brainstorming": "alex",
+        "analisi":       "alex",
+        "default":       "alex",
+    }
+
     args       = context.args or []
     agent_name = args[0].lower() if args else None
     limit      = int(args[1]) if len(args) > 1 and args[1].isdigit() else 20
 
-    if agent_name and agent_name not in ANALYZABLE_AGENTS:
+    # Se non specificato, prendi l'agente del topic corrente
+    if not agent_name:
+        topic      = get_topic(update)
+        agent_name = TOPIC_TO_AGENT.get(topic, "alex")
+
+    if agent_name not in ANALYZABLE_AGENTS:
         nomi = ", ".join(f"`{a}`" for a in ANALYZABLE_AGENTS)
         await update.message.reply_text(
             f"❌ Agente non riconosciuto: `{agent_name}`\n\nAgenti disponibili: {nomi}",
@@ -812,11 +829,9 @@ async def cmd_mentor(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    agents_to_run = [agent_name] if agent_name else list(ANALYZABLE_AGENTS.keys())
-
     status = await update.message.reply_text(
-        f"🧠 *Mentor* sta analizzando: {', '.join(agents_to_run)}\n"
-        f"_(ultime {limit} conversazioni per agente)_",
+        f"🧠 *Mentor* sta analizzando *{agent_name.capitalize()}*\n"
+        f"_(ultime {limit} conversazioni)_",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -825,15 +840,12 @@ async def cmd_mentor(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=update.effective_chat.id, action=ChatAction.TYPING
         )
         await status.delete()
-
-        for name in agents_to_run:
-            await _run_mentor_for_agent(
-                agent_name=name,
-                limit=limit,
-                reply_fn=update.message.reply_text,
-                bot_data=context.application.bot_data,
-            )
-
+        await _run_mentor_for_agent(
+            agent_name=agent_name,
+            limit=limit,
+            reply_fn=update.message.reply_text,
+            bot_data=context.application.bot_data,
+        )
     except Exception as e:
         logger.error(f"Errore /mentor: {e}", exc_info=True)
         await update.message.reply_text("⚠️ Errore durante l'analisi. Riprova.")
@@ -920,12 +932,21 @@ async def handle_mentor_callback(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def job_mentor_weekly(context):
-    """Job domenicale: analizza tutti gli agenti e invia i report nel gruppo."""
+    """
+    Job domenicale: analizza UN agente per settimana in rotazione,
+    per non sprecare il daily token limit.
+    """
     if not GROUP_CHAT_ID:
         logger.warning("GROUP_CHAT_ID non configurato — skip job mentor")
         return
 
-    logger.info("Job mentor settimanale avviato")
+    # Rotazione settimanale: usa il numero della settimana per scegliere l'agente
+    import datetime as _dt
+    week_number = _dt.date.today().isocalendar()[1]
+    agents_list = list(ANALYZABLE_AGENTS.keys())
+    agent_name  = agents_list[week_number % len(agents_list)]
+
+    logger.info(f"Job mentor settimanale: analisi di '{agent_name}' (settimana {week_number})")
     try:
         async def send_to_group(text, parse_mode, reply_markup=None):
             await context.bot.send_message(
@@ -935,13 +956,12 @@ async def job_mentor_weekly(context):
                 reply_markup=reply_markup,
             )
 
-        for name in ANALYZABLE_AGENTS:
-            await _run_mentor_for_agent(
-                agent_name=name,
-                limit=20,
-                reply_fn=send_to_group,
-                bot_data=context.application.bot_data,
-            )
+        await _run_mentor_for_agent(
+            agent_name=agent_name,
+            limit=15,
+            reply_fn=send_to_group,
+            bot_data=context.application.bot_data,
+        )
     except Exception as e:
         logger.error(f"Errore job mentor: {e}", exc_info=True)
 
