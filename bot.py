@@ -12,6 +12,10 @@ from telegram.constants import ParseMode, ChatAction
 
 from agents import run_pipeline
 from memory import init_db, get_memory, set_memory, update_topics, format_memory_for_prompt
+from mentor_agent import (
+    mentor_analyze_agent, mentor_analyze_all,
+    format_analysis_for_telegram, ANALYZABLE_AGENTS,
+)
 from news_agent import (
     fetch_new_multiplayer_news, fetch_recent_news,
     luca_comment_news, luca_daily_digest, luca_news_summary,
@@ -600,6 +604,82 @@ async def cmd_agenti(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def cmd_mentor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /mentor          → analizza tutti gli agenti
+    /mentor alex     → analizza solo Alex
+    /mentor alex 30  → analizza Alex sulle ultime 30 conversazioni
+    """
+    args        = context.args or []
+    agent_name  = args[0].lower() if args else None
+    limit       = int(args[1]) if len(args) > 1 and args[1].isdigit() else 20
+
+    # Valida agente se specificato
+    if agent_name and agent_name not in ANALYZABLE_AGENTS:
+        nomi = ", ".join(f"`{a}`" for a in ANALYZABLE_AGENTS)
+        await update.message.reply_text(
+            f"❌ Agente non riconosciuto: `{agent_name}`\n\nAgenti disponibili: {nomi}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if agent_name:
+        status = await update.message.reply_text(
+            f"🧠 *Mentor* sta analizzando *{agent_name.capitalize()}*\n"
+            f"_(ultime {limit} conversazioni)_",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        try:
+            await context.bot.send_chat_action(
+                chat_id=update.effective_chat.id, action=ChatAction.TYPING
+            )
+            report = await mentor_analyze_agent(agent_name, limit=limit)
+            await status.delete()
+            msg = format_analysis_for_telegram(report)
+            await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            logger.error(f"Errore /mentor {agent_name}: {e}", exc_info=True)
+            await status.edit_text("⚠️ Errore durante l'analisi. Riprova.")
+    else:
+        status = await update.message.reply_text(
+            f"🧠 *Mentor* sta analizzando tutti gli agenti...\n"
+            f"_(ultime {limit} conversazioni ciascuno — potrebbe richiedere qualche minuto)_",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        try:
+            reports = await mentor_analyze_all(limit=limit)
+            await status.delete()
+            for report in reports:
+                msg = format_analysis_for_telegram(report)
+                await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            logger.error(f"Errore /mentor all: {e}", exc_info=True)
+            await status.edit_text("⚠️ Errore durante l'analisi. Riprova.")
+
+
+async def job_mentor_weekly(context):
+    """
+    Job domenicale: analizza tutti gli agenti e invia il report nel gruppo.
+    Attivato se ENABLE_MENTOR_JOB=true nelle variabili d'ambiente.
+    """
+    if not GROUP_CHAT_ID:
+        logger.warning("GROUP_CHAT_ID non configurato — skip job mentor")
+        return
+
+    logger.info("Job mentor settimanale avviato")
+    try:
+        reports = await mentor_analyze_all(limit=20)
+        for report in reports:
+            msg = format_analysis_for_telegram(report)
+            await context.bot.send_message(
+                chat_id=GROUP_CHAT_ID,
+                text=msg,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+    except Exception as e:
+        logger.error(f"Errore job mentor: {e}", exc_info=True)
+
+
 async def cmd_dietro(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current = context.user_data.get("show_behind", False)
     context.user_data["show_behind"] = not current
@@ -729,6 +809,7 @@ async def post_init(app):
         BotCommand("nota",    "Aggiungi una nota su di te"),
         BotCommand("dietro",  "Toggle ragionamento interno"),
         BotCommand("news",    "Ultime notizie gaming"),
+        BotCommand("mentor",  "Analisi e miglioramento agenti"),
     ])
 
     if os.environ.get("ENABLE_NEWS_JOB", "false").lower() == "true":
@@ -743,6 +824,14 @@ async def post_init(app):
     if os.environ.get("ENABLE_SOPHIA_RECAP", "false").lower() == "true":
         app.job_queue.run_daily(
             job_sophia_daily_recap, time=datetime.time(16, 0, 0), name="sophia_recap",
+        )
+
+    if os.environ.get("ENABLE_MENTOR_JOB", "false").lower() == "true":
+        app.job_queue.run_daily(
+            job_mentor_weekly,
+            time=datetime.time(8, 0, 0),   # domenica 08:00 UTC = 10:00 CEST
+            days=(6,),                      # 6 = domenica
+            name="mentor_weekly",
         )
 
     # Promemoria sempre attivi
@@ -770,6 +859,7 @@ def main():
     app.add_handler(CommandHandler("nota",    cmd_nota))
     app.add_handler(CommandHandler("dietro",  cmd_dietro))
     app.add_handler(CommandHandler("news",    cmd_news))
+    app.add_handler(CommandHandler("mentor",  cmd_mentor))
 
     # Benvenuto nuovi membri
     app.add_handler(ChatMemberHandler(handle_new_member, ChatMemberHandler.CHAT_MEMBER))
