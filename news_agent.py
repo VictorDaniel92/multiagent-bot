@@ -246,20 +246,24 @@ async def _get_news_thread_context(limit: int = 5) -> str:
         return ""
 
 
-async def luca_answer_question(question: str) -> str:
+async def luca_answer_question(question: str, profile_context: str = "") -> str:
     """
     Luca risponde a una domanda libera dell'utente nel topic news.
     Risponde come critico videoludico — con opinioni, contesto storico, senza filtri.
+    Usa il profilo utente per personalizzare (es. filtro Metacritic, generi preferiti).
     """
     thread_ctx = await _get_news_thread_context()
 
     system = f"""{SOUL_LUCA}
+
+{profile_context}
 
 Un utente ti ha scritto nel topic news/videogiochi del canale Telegram.
 Rispondi come faresti in un editoriale: con competenza, opinioni nette e contesto.
 
 Regole:
 - Rispondi direttamente alla domanda senza preamboli
+- Se l'utente ha un filtro Metacritic, tienilo in mente per i consigli
 - Se la domanda riguarda un gioco, uno studio o una tendenza del settore, porta la tua prospettiva critica
 - Puoi fare riferimenti storici ad altri giochi o momenti dell'industria
 - Lunghezza: 3-6 frasi, mai oltre

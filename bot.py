@@ -39,6 +39,10 @@ from sophia_agent import (
     sophia_log_activity, sophia_get_activity, sophia_reset_activity,
     sophia_parse_reminder, sophia_add_reminder, sophia_get_due_reminders,
 )
+from user_profiles import (
+    init_profiles_db, get_profile, auto_update_profile,
+    format_profile_for_prompt, sophia_parse_profile_declaration,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -165,6 +169,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             return
 
+        # Controlla se è una dichiarazione di profilo ("Sophia, abito a Milano, mi piace il gaming")
+        profile_triggers = r'\b(abito|vivo|sono di|mi chiamo|mi piace|preferisco|mi interessano|gioco a|lavoro a)\b'
+        if re.search(profile_triggers, clean_question, re.IGNORECASE):
+            updated = await sophia_parse_profile_declaration(user_id, user_name, clean_question)
+            if updated:
+                city      = updated.get("city", "")
+                interests = ", ".join(updated.get("interests", [])[:4])
+                details   = f"città: {city}" if city else ""
+                if interests:
+                    details += f", interessi: {interests}" if details else f"interessi: {interests}"
+                await message.reply_text(
+                    f"🌸 Grazie {user_name}! Ho aggiornato il tuo profilo"
+                    f"{(' — ' + details) if details else ''}.\n"
+                    f"Gli agenti useranno queste informazioni per personalizzare le risposte.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+
         # Controlla se è una domanda sulla memoria del gruppo
         memory_triggers = r'\b(si è parlato|hai detto|ricordi|ha detto|parlato di|discusso|ieri|stamattina|oggi|recente|ultima volta)\b'
         if re.search(memory_triggers, clean_question, re.IGNORECASE):
@@ -271,13 +293,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_msg = await message.reply_text("🎮 *Luca* sta pensando...", parse_mode=ParseMode.MARKDOWN)
         try:
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-            answer = await luca_answer_question(question)
+            profile        = await get_profile(user_id)
+            profile_ctx    = format_profile_for_prompt(profile)
+            answer = await luca_answer_question(question, profile_context=profile_ctx)
             await status_msg.delete()
             await message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
             mark_message_answered(message.message_id)
             await save_conversation(user_id=user_id, topic="news", agent="luca",
                                     question=question, answer=answer)
-            # Sophia valuta collegamento cross-agente
             asyncio.create_task(sophia_check_cross_agent_link(
                 context.bot, GROUP_CHAT_ID, "luca", "news", question, answer
             ))
@@ -389,9 +412,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── PIPELINE GENERALE ─────────────────────────────────────────────────
-    memory_context = await format_memory_for_prompt(user_id)
+    # Carica profilo ricco — sostituisce il vecchio format_memory_for_prompt
+    profile        = await get_profile(user_id)
+    memory_context = format_profile_for_prompt(profile)
 
-    # Cerca ricordi semanticamente simili alla domanda
+    # Integra con ricordi semantici (vector memory)
     past_memories = await search_memories(question, user_id=user_id, topic=topic, limit=3)
     if past_memories:
         memory_context += "\n\n" + format_memories_for_prompt(past_memories)
@@ -419,6 +444,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             agent="alex",
             question=question,
             answer=result["answer"],
+        )
+
+        # Aggiornamento automatico profilo (silenzioso, non blocca)
+        # Non aggiorna il profilo dell'owner che è manuale
+        import asyncio as _asyncio
+        _asyncio.ensure_future(
+            auto_update_profile(user_id, update.effective_user.first_name, question, topic)
         )
 
         if context.user_data.get("show_behind") and result["queries"]:
@@ -499,6 +531,43 @@ async def cmd_memoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if isinstance(value, list):
             value = ", ".join(value)
         lines.append(f"• *{key}*: {value}")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_profilo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mostra il profilo ricco dell'utente."""
+    user_id = update.effective_user.id
+    profile = await get_profile(user_id)
+    if not profile:
+        await update.message.reply_text(
+            "Non ho ancora un profilo per te.\n\n"
+            "Puoi dichiararlo in General: _'Sophia, abito a Milano, mi piace il gaming'_\n"
+            "Oppure verrà costruito automaticamente nel tempo.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    lines = ["👤 *Il tuo profilo:*\n"]
+    if profile.get("name"):        lines.append(f"• Nome: {profile['name']}")
+    if profile.get("city"):        lines.append(f"• Città: {profile['city']}")
+    if profile.get("style"):       lines.append(f"• Stile: {profile['style']}")
+    if profile.get("response_length"): lines.append(f"• Risposte: {profile['response_length']}")
+    interests = profile.get("interests", [])
+    if interests:                  lines.append(f"• Interessi: {', '.join(interests)}")
+    gaming = profile.get("gaming", {})
+    if gaming.get("metacritic_filter"):
+        lines.append(f"• Filtro Metacritic: ≥ {gaming['metacritic_filter']}")
+    if gaming.get("preferred_genres"):
+        lines.append(f"• Generi gaming: {gaming['preferred_genres']}")
+    travel = profile.get("travel", {})
+    if travel:
+        active = "sì" if travel.get("active", True) else "no"
+        lines.append(f"• Viaggi attivi: {active}")
+    if profile.get("manual"):
+        lines.append("\n_Profilo dichiarato manualmente ✓_")
+    else:
+        lines.append("\n_Profilo costruito automaticamente_")
+
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
@@ -647,6 +716,7 @@ async def post_init(app):
     await init_db()
     await init_news_db()
     await init_vector_db()
+    await init_profiles_db()
 
     # Avvia il server webhook in parallelo
     set_bot_app(app)
@@ -654,6 +724,7 @@ async def post_init(app):
     await app.bot.set_my_commands([
         BotCommand("start",   "Benvenuto e info"),
         BotCommand("agenti",  "Chi c'è nel gruppo"),
+        BotCommand("profilo", "Il tuo profilo utente"),
         BotCommand("memoria", "Cosa ricordo di te"),
         BotCommand("nota",    "Aggiungi una nota su di te"),
         BotCommand("dietro",  "Toggle ragionamento interno"),
@@ -695,6 +766,7 @@ def main():
     app.add_handler(CommandHandler("start",   start))
     app.add_handler(CommandHandler("agenti",  cmd_agenti))
     app.add_handler(CommandHandler("memoria", cmd_memoria))
+    app.add_handler(CommandHandler("profilo", cmd_profilo))
     app.add_handler(CommandHandler("nota",    cmd_nota))
     app.add_handler(CommandHandler("dietro",  cmd_dietro))
     app.add_handler(CommandHandler("news",    cmd_news))

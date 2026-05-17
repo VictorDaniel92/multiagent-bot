@@ -247,13 +247,12 @@ async def alex_answer(
 
     system = f"""{SOUL_ALEX}
 
-{SOUL_USER}
-
 {memory_context}
 
 ## Stile per questo topic
 {config['alex_style']}
 
+Adatta sempre il tono, la lunghezza e il livello di dettaglio al profilo utente sopra.
 Rispondi sempre in italiano. Sii diretto — inizia subito con la risposta."""
 
     context = f"""Domanda: {user_question}
