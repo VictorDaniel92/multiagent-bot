@@ -20,11 +20,23 @@ SOULS_DIR   = Path(__file__).parent / "souls"
 SOUL_MENTOR = load_soul("mentor")
 
 # Agenti analizzabili dal Mentor e il loro nome nel vector store
+# Mappa nome_logico → nome_agente_nel_DB (come salvato da save_conversation in bot.py)
+# Max e Sofia sono interni al pipeline — le loro conversazioni vengono salvate come "alex"
+# Per analizzarli usiamo le stesse conversazioni di alex + il briefing che producono
 ANALYZABLE_AGENTS = {
-    "max":    "max",
-    "sofia":  "sofia",
-    "alex":   "alex",
-    "luca":   "luca",
+    "alex":   "alex",    # pipeline generale Max→Sofia→Alex
+    "luca":   "luca",    # topic news / gaming
+    "giorgio": "giorgio", # topic meteo
+    "marco":  "marco",   # topic viaggi
+}
+
+# Descrizione estesa per il Mentor — spiega il ruolo di ogni agente
+AGENT_DESCRIPTIONS = {
+    "alex":    "Risponde alle domande generali (ricerca, coding, brainstorming, analisi). "
+               "Usa il lavoro interno di Max (pianificatore) e Sofia (ricercatrice).",
+    "luca":    "Critico videoludico. Risponde nel topic news/gaming con stile editoriale.",
+    "giorgio": "Meteorologo. Risponde nel topic meteo con previsioni e briefing mattutini.",
+    "marco":   "Esperto di viaggi. Risponde nel topic viaggi.",
 }
 
 
@@ -41,7 +53,7 @@ async def collect_agent_conversations(agent_name: str, limit: int = 20) -> list[
         return []
 
     conversations = await get_recent_conversations(agent=agent_key, limit=limit)
-    logger.info(f"Recuperate {len(conversations)} conversazioni per {agent_name}")
+    logger.info(f"Recuperate {len(conversations)} conversazioni per {agent_name} (DB key: {agent_key})")
     return conversations
 
 
@@ -99,12 +111,14 @@ async def mentor_analyze_agent(agent_name: str, limit: int = 20) -> dict:
     # Carica il soul attuale dell'agente come riferimento
     current_soul = load_soul(agent_name)
     soul_section = f"## Soul attuale di {agent_name}\n{current_soul}" if current_soul else ""
+    agent_desc   = AGENT_DESCRIPTIONS.get(agent_name, "")
 
     conv_text = _format_conversations_for_analysis(conversations)
 
     system = f"""{SOUL_MENTOR}
 
 Stai analizzando le conversazioni recenti dell'agente **{agent_name}**.
+Ruolo: {agent_desc}
 
 {soul_section}
 
