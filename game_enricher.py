@@ -398,42 +398,27 @@ async def _scrape_psn_guide(client: httpx.AsyncClient, guide_url: str, data: Gam
 
     game_name = data.name
 
-    # Cerca i dati della guida tramite Google
-    queries = [
-        f'psnprofiles "{game_name}" trophy guide difficulty time playthroughs missable',
-        f'"{game_name}" platinum trophy guide missable trophies playthroughs hours',
-    ]
-
-    all_snippets = []
-    for q in queries:
-        results = await asyncio.get_event_loop().run_in_executor(
-            None, lambda q=q: web_search(q, max_results=4)
+    # Una sola query mirata invece di due
+    results = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: web_search(
+            f'psnprofiles "{game_name}" platinum difficulty hours playthroughs missable',
+            max_results=3
         )
-        all_snippets.extend(results)
+    )
 
-    if not all_snippets:
+    if not results:
         logger.info("PSN Guide: nessun snippet trovato via Serper")
         return
 
-    snippets_text = format_results(all_snippets)
-    logger.info(f"PSN Guide snippets trovati: {len(all_snippets)}")
+    # Tronca aggressivamente — bastano i primi 1000 chars per i dati strutturati
+    snippets_text = format_results(results)[:1000]
+    logger.info(f"PSN Guide snippets trovati: {len(results)}")
 
-    # Usa il LLM per estrarre i dati strutturati dagli snippet
     raw = await call_llm(
-        system="""Sei un estrattore di dati da testi su guide di trofei PlayStation.
-Estrai le informazioni dalla guida al platino e rispondi SOLO con JSON valido:
-{
-  "difficulty": "X/10 o stringa descrittiva o null",
-  "time": "X-Y ore o null",
-  "playthroughs": "numero o null",
-  "missable": "Sì (N) o No o null"
-}
-Se un dato non è presente nei testi, metti null.
-Non inventare dati non presenti.""",
-        messages=[{"role": "user", "content":
-            f"Gioco: {game_name}\n\nTesti trovati:\n{snippets_text[:3000]}"
-        }],
-        max_tokens=150,
+        system='Estrai dati guida platino. Rispondi SOLO con JSON: {"difficulty":"X/10 o null","time":"X-Y ore o null","playthroughs":"N o null","missable":"Sì/No o null"}',
+        messages=[{"role": "user", "content": f"{game_name}:\n{snippets_text}"}],
+        max_tokens=80,
     )
 
     import json

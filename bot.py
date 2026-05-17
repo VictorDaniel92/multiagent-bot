@@ -336,9 +336,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mark_message_answered(message.message_id)
             await save_conversation(user_id=user_id, topic="news", agent="luca",
                                     question=question, answer=answer)
-            asyncio.create_task(sophia_check_cross_agent_link(
-                context.bot, GROUP_CHAT_ID, "luca", "news", question, answer
-            ))
+            if os.environ.get("ENABLE_CROSS_AGENT", "false").lower() == "true":
+                asyncio.create_task(sophia_check_cross_agent_link(
+                    context.bot, GROUP_CHAT_ID, "luca", "news", question, answer
+                ))
         except Exception as e:
             logger.error(f"Errore Luca: {e}", exc_info=True)
             await status_msg.edit_text("⚠️ Errore. Riprova tra qualche secondo.")
@@ -424,10 +425,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mark_message_answered(message.message_id)
             await save_conversation(user_id=user_id, topic="viaggi", agent="marco",
                                     question=question, answer=answer)
-            # Sophia valuta collegamento cross-agente
-            asyncio.create_task(sophia_check_cross_agent_link(
-                context.bot, GROUP_CHAT_ID, "marco", "viaggi", question, answer
-            ))
+            if os.environ.get("ENABLE_CROSS_AGENT", "false").lower() == "true":
+                asyncio.create_task(sophia_check_cross_agent_link(
+                    context.bot, GROUP_CHAT_ID, "marco", "viaggi", question, answer
+                ))
         except Exception as e:
             logger.error(f"Errore Marco: {e}", exc_info=True)
             await status_msg.edit_text("⚠️ Errore. Riprova tra qualche secondo.")

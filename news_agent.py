@@ -391,9 +391,11 @@ Regole:
 
 async def luca_answer_question(question: str, profile_context: str = "") -> str:
     """
-    Luca risponde a una domanda libera nel topic news.
-    Cerca su Google per dati aggiornati, poi arricchisce con dati da
-    Metacritic, Multiplayer.it, HowLongToBeat e PSNProfiles.
+    Luca risponde a una domanda nel topic news.
+    Ottimizzato per minimizzare le chiamate LLM:
+    - domanda generica: 1 chiamata (risposta diretta + web search)
+    - domanda su gioco specifico: 2 chiamate (detect + risposta)
+    - domanda sul platino: 2 chiamate (detect + platinum answer con dati guida)
     """
     from game_enricher import detect_game_name, enrich_game_data
     from search import web_search, format_results
@@ -403,58 +405,59 @@ async def luca_answer_question(question: str, profile_context: str = "") -> str:
         question, re.I
     ))
 
-    # Ricerca Google e rilevamento gioco in parallelo
-    search_query = f"{question} {datetime.date.today().year}"
-    game_name, search_results = await asyncio.gather(
-        detect_game_name(question),
-        asyncio.get_event_loop().run_in_executor(None, lambda: web_search(search_query, max_results=4)),
+    # Ricerca Google sempre in background (sincrona, non costa token LLM)
+    search_query   = f"{question} {datetime.date.today().year}"
+    search_results = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: web_search(search_query, max_results=3)
     )
+    # Tronca a 800 chars — abbastanza per dati aggiornati, non troppo da bruciare token
+    web_context = f"\n\n## Aggiornamenti:\n{format_results(search_results)[:800]}" if search_results else ""
 
-    web_context = ""
-    if search_results:
-        formatted = format_results(search_results)
-        web_context = f"\n\n## Risultati ricerca aggiornati:\n{formatted}"
+    # Rilevamento gioco solo se necessario (platino o domanda specifica)
+    # Euristica rapida: c'è un titolo di gioco nella domanda?
+    has_game_hint = bool(re.search(
+        r'\b(gioco|game|titolo|uscita|recensione|platino|platinum|dlc|sequel|remake|remaster)\b',
+        question, re.I
+    ))
 
+    game_name  = None
+    stats_block = ""
     review_context = ""
-    stats_block    = ""
 
-    if game_name:
-        logger.info(f"Luca: arricchimento dati per '{game_name}' (platinum={is_platinum_question})")
-        game_data = await enrich_game_data(game_name)
-        stats_block = game_data.format_for_telegram()
+    if has_game_hint or is_platinum_question:
+        game_name = await detect_game_name(question)  # 1 chiamata LLM
 
-        if game_data.multiplayer_review_text:
-            review_context = (
-                f"\n\n## Recensione di Multiplayer.it per {game_name}:\n"
-                f"{game_data.multiplayer_review_text}\n\n"
-                f"Usa questa recensione come base per la tua risposta."
-            )
+        if game_name:
+            logger.info(f"Luca: enrichment '{game_name}' (platinum={is_platinum_question})")
+            game_data   = await enrich_game_data(game_name)
+            stats_block = game_data.format_for_telegram()
 
-        if is_platinum_question and game_data.psn_guide_url:
-            return await _luca_platinum_answer(question, game_name, game_data, profile_context, web_context)
+            if game_data.multiplayer_review_text:
+                review_context = (
+                    f"\n\n## Recensione Multiplayer.it per {game_name}:\n"
+                    f"{game_data.multiplayer_review_text[:800]}"
+                )
 
+            # Platino: risposta dedicata (1 chiamata LLM con tutti i dati)
+            if is_platinum_question:
+                return await _luca_platinum_answer(
+                    question, game_name, game_data, profile_context, web_context
+                )
+
+    # Risposta standard — 1 sola chiamata LLM
     system = f"""{SOUL_LUCA}
 
 {profile_context}
 
-Un utente ti ha scritto nel topic news/videogiochi del canale Telegram.
-Rispondi come faresti in un editoriale: con competenza, opinioni nette e contesto.
-Usa i risultati di ricerca per dare informazioni aggiornate e accurate — non usare dati che sai essere vecchi.
-
-Regole:
-- Rispondi direttamente senza preamboli
-- Se hai la recensione di Multiplayer.it, usala come base ma esprimi la TUA voce critica
-- Puoi fare riferimenti storici ad altri giochi
-- Lunghezza: 3-6 frasi, mai oltre
-- Formato Telegram: *grassetto* per titoli/nomi importanti
-- Scrivi in italiano{review_context}{web_context}"""
+Rispondi come critico videoludico: competente, diretto, con opinioni nette.
+Usa i risultati di ricerca per dati aggiornati. Max 4 frasi. Scrivi in italiano.
+Formato Telegram: *grassetto* per titoli importanti.{review_context}{web_context}"""
 
     answer = await call_llm(
         system=system,
         messages=[{"role": "user", "content": question}],
-        max_tokens=350,
+        max_tokens=300,
     )
-
     return answer + (stats_block if stats_block else "")
 
 
