@@ -193,14 +193,15 @@ PROVIDERS = [
         "name":    "Cerebras",
         "url":     "https://api.cerebras.ai/v1/chat/completions",
         "api_key": os.environ.get("CEREBRAS_API_KEY", ""),
-        "model":   "llama-3.3-70b",
+        # llama3.1-8b è sempre disponibile nel free tier Cerebras
+        # llama-3.3-70b richiede approvazione account
+        "model":   os.environ.get("CEREBRAS_MODEL", "llama3.1-8b"),
     },
     {
         "name":    "HuggingFace",
-        "url":     "https://api-inference.huggingface.co/models/meta-llama/Llama-3.3-70B-Instruct/v1/chat/completions",
+        "url":     "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3/v1/chat/completions",
         "api_key": os.environ.get("HUGGINGFACE_API_KEY", ""),
-        "model":   "meta-llama/Llama-3.3-70B-Instruct",
-        # Gratuito sempre, ma più lento (cold start possibile)
+        "model":   "mistralai/Mistral-7B-Instruct-v0.3",
     },
 ]
 
