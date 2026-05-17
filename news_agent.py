@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from pathlib import Path
 from datetime import date, timedelta
@@ -109,6 +110,104 @@ async def cleanup_old_news(keep_days: int = 30):
 
 # ── SCRAPER ───────────────────────────────────────────────────────────────────
 
+def _parse_minutes_ago(text: str) -> int | None:
+    """
+    Converte timestamp relativi italiani in minuti.
+    Es: "13 minuti fa" → 13, "un'ora fa" → 60, "2 ore fa" → 120
+    Ritorna None se non riconosce il formato.
+    """
+    text = text.lower().strip()
+    import re
+    if m := re.match(r"(\d+)\s+minut", text):
+        return int(m.group(1))
+    if "un'ora" in text or "un ora" in text:
+        return 60
+    if m := re.match(r"(\d+)\s+or", text):
+        return int(m.group(1)) * 60
+    if "ieri" in text:
+        return 60 * 24
+    return None
+
+
+async def _fetch_homepage_html() -> str | None:
+    """Scarica la homepage di multiplayer.it e restituisce l'HTML."""
+    try:
+        async with httpx.AsyncClient(
+            timeout=20,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"},
+            follow_redirects=True,
+        ) as client:
+            resp = await client.get("https://multiplayer.it/")
+            resp.raise_for_status()
+            return resp.text
+    except Exception as e:
+        logger.error(f"Errore fetch homepage: {e}")
+        return None
+
+
+async def fetch_recent_news(hours: int = 4) -> list[dict]:
+    """
+    Scarica la homepage e restituisce le notizie pubblicate
+    nelle ultime `hours` ore, con timestamp relativo.
+    Non filtra per "già viste" — serve per il sunto manuale.
+    """
+    html = await _fetch_homepage_html()
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    max_minutes = hours * 60
+    results: list[dict] = []
+    seen_urls: set[str] = set()
+
+    # La homepage mostra gli articoli come blocchi con timestamp vicino al link
+    # Cerchiamo tutti i tag che contengono sia un link /notizie/ che un testo temporale
+    for container in soup.find_all(True):
+        text = container.get_text(" ", strip=True)
+
+        # Cerca timestamp nel testo del contenitore
+        import re
+        time_match = re.search(
+            r"(\d+\s+minut[io]?\s+fa|un['']\s*ora\s+fa|\d+\s+ore?\s+fa|ieri)",
+            text, re.IGNORECASE
+        )
+        if not time_match:
+            continue
+
+        minutes_ago = _parse_minutes_ago(time_match.group(0))
+        if minutes_ago is None or minutes_ago > max_minutes:
+            continue
+
+        # Trova il link notizia dentro questo contenitore
+        for a in container.find_all("a", href=True):
+            href: str = a["href"]
+            if "/notizie/" not in href:
+                continue
+
+            url = (BASE_URL + href) if href.startswith("/") else href
+            url = url.split("?")[0].rstrip("/")
+
+            if url in seen_urls:
+                continue
+            if any(p in url.lower() for p in SKIP_PATTERNS):
+                continue
+
+            title = a.get_text(strip=True)
+            if not title or len(title) < 15:
+                continue
+
+            seen_urls.add(url)
+            results.append({
+                "title":       title,
+                "url":         url,
+                "minutes_ago": minutes_ago,
+            })
+
+    # Ordina dalla più recente
+    results.sort(key=lambda x: x["minutes_ago"])
+    logger.info(f"Notizie ultime {hours}h trovate: {len(results)}")
+    return results
+
 async def fetch_new_multiplayer_news(max_items: int = 30) -> list[dict]:
     """
     Scarica le ultime notizie da multiplayer.it e restituisce solo
@@ -163,8 +262,6 @@ async def fetch_new_multiplayer_news(max_items: int = 30) -> list[dict]:
 # ── AGENTE LUCA ───────────────────────────────────────────────────────────────
 
 async def luca_comment_news(title: str, url: str) -> str:
-    thread_ctx = await _get_news_thread_context(limit=8)
-
     system = f"""{SOUL_LUCA}
 
 Stai scrivendo un commento a caldo su una notizia videoludica per un canale Telegram.
@@ -176,10 +273,7 @@ Regole:
 - Parti direttamente con la tua reazione/analisi
 - Sii opinionato: prendi una posizione, non fare il neutro
 - Usa il formato Telegram: *grassetto* solo per parole chiave importanti
-- Niente emoji tranne al massimo una alla fine se appropriata
-- NON commentare notizie simili a quelle che hai già trattato di recente
-
-{thread_ctx}"""
+- Niente emoji tranne al massimo una alla fine se appropriata"""
 
     return await call_llm(
         system=system,
@@ -228,50 +322,61 @@ Scrivi in italiano. Prosa fluida come un editoriale."""
     )
 
 
-async def _get_news_thread_context(limit: int = 5) -> str:
-    """Recupera le ultime conversazioni nel topic news per il contesto."""
-    try:
-        from memory_vector import get_recent_conversations
-        recents = await get_recent_conversations(topic="news", limit=limit)
-        if not recents:
-            return ""
-        lines = ["## Ultime discussioni nel topic News (non ripetere questi argomenti già trattati)"]
-        for r in recents:
-            from memory_vector import _time_ago
-            ago = _time_ago(r["created_at"])
-            lines.append(f"- [{ago}] D: {r['question'][:80]} → R: {r['answer'][:120]}")
-        return "\n".join(lines)
-    except Exception as e:
-        logger.error(f"Errore thread context news: {e}")
-        return ""
-
-
-async def luca_answer_question(question: str, profile_context: str = "") -> str:
+async def luca_summarize_recent(news_items: list[dict], hours: int = 4) -> str:
     """
-    Luca risponde a una domanda libera dell'utente nel topic news.
-    Risponde come critico videoludico — con opinioni, contesto storico, senza filtri.
-    Usa il profilo utente per personalizzare (es. filtro Metacritic, generi preferiti).
+    Luca fa un sunto delle notizie delle ultime N ore su richiesta esplicita.
     """
-    thread_ctx = await _get_news_thread_context()
+    if not news_items:
+        return (
+            f"🎮 Nelle ultime {hours} ore da *Multiplayer.it* non è uscito nulla "
+            f"di rilevante. O è una giornata tranquilla, o il settore sta trattenendo "
+            f"il respiro prima di qualcosa di grosso."
+        )
+
+    news_list = "\n".join(
+        f"- {item['title']} ({item['minutes_ago']} min fa)"
+        for item in news_items[:12]
+    )
 
     system = f"""{SOUL_LUCA}
 
-{profile_context}
+Un utente ti ha chiesto un sunto delle ultime {hours} ore di notizie videoludiche da Multiplayer.it.
+Rispondi come faresti in un rapido briefing redazionale: cosa è successo, cosa conta davvero.
+
+Struttura (prosa, non elenchi):
+1. Una frase che inquadra il tono delle ultime ore
+2. Le notizie più significative con il tuo commento critico (2-3 righe ciascuna)
+3. Eventuale collegamento tra le notizie se c'è un filo comune
+
+Inizia con: 🎮 *Sunto ultime {hours} ore —*
+
+Lunghezza: 200-300 parole. Usa *grassetto* per i titoli dei giochi/notizie principali.
+Scrivi in italiano. Sii diretto — niente introduzioni inutili."""
+
+    return await call_llm(
+        system=system,
+        messages=[{"role": "user", "content": f"Notizie:\n{news_list}"}],
+        max_tokens=500,
+    )
+
+
+# ── FORMATTAZIONE ─────────────────────────────────────────────────────────────
+    """
+    Luca risponde a una domanda libera dell'utente nel topic news.
+    Risponde come critico videoludico — con opinioni, contesto storico, senza filtri.
+    """
+    system = f"""{SOUL_LUCA}
 
 Un utente ti ha scritto nel topic news/videogiochi del canale Telegram.
 Rispondi come faresti in un editoriale: con competenza, opinioni nette e contesto.
 
 Regole:
 - Rispondi direttamente alla domanda senza preamboli
-- Se l'utente ha un filtro Metacritic, tienilo in mente per i consigli
 - Se la domanda riguarda un gioco, uno studio o una tendenza del settore, porta la tua prospettiva critica
 - Puoi fare riferimenti storici ad altri giochi o momenti dell'industria
 - Lunghezza: 3-6 frasi, mai oltre
 - Formato Telegram: *grassetto* per titoli/nomi importanti
-- Scrivi in italiano
-- NON ripetere o parafrasare risposte che hai già dato di recente
-
-{thread_ctx}"""
+- Scrivi in italiano"""
 
     return await call_llm(
         system=system,
@@ -280,98 +385,50 @@ Regole:
     )
 
 
-# ── FETCH RECENTI (per /news on-demand) ──────────────────────────────────────
+# ── FORMATTAZIONE ─────────────────────────────────────────────────────────────
 
-async def fetch_recent_news(max_items: int = 20) -> list[dict]:
+async def luca_answer_question(question: str) -> str:
     """
-    Scarica le ultime notizie da multiplayer.it senza filtrare per seen_news.
-    Usato dal comando /news per il sunto on-demand delle ultime ore.
+    Luca risponde a una domanda libera nel topic news.
+    Se la domanda riguarda un gioco specifico, arricchisce la risposta
+    con dati da Metacritic, Multiplayer.it, HowLongToBeat e PSNProfiles.
     """
-    try:
-        async with httpx.AsyncClient(
-            timeout=20,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"},
-            follow_redirects=True,
-        ) as client:
-            resp = await client.get(NEWS_PAGE_URL)
-            resp.raise_for_status()
-    except Exception as e:
-        logger.error(f"Errore fetch recenti: {e}")
-        return []
-
-    soup     = BeautifulSoup(resp.text, "html.parser")
-    seen_urls: set[str]  = set()
-    news:      list[dict] = []
-
-    for a in soup.find_all("a", href=True):
-        href: str = a["href"]
-        if "/notizie/" not in href:
-            continue
-
-        url = (BASE_URL + href) if href.startswith("/") else href
-        url = url.split("?")[0].rstrip("/")
-
-        if url in seen_urls:
-            continue
-        seen_urls.add(url)
-
-        if any(p in url.lower() for p in SKIP_PATTERNS):
-            continue
-
-        title = a.get_text(strip=True)
-        if not title or len(title) < 15:
-            continue
-
-        news.append({"title": title, "url": url})
-        if len(news) >= max_items:
-            break
-
-    logger.info(f"Notizie recenti trovate: {len(news)}")
-    return news
-
-
-async def luca_news_summary(news_items: list[dict], hours: int = 4) -> str:
-    """
-    Luca fa un sunto delle ultime N ore di notizie su multiplayer.it.
-    Restituisce un messaggio con il sunto senza link individuali.
-    """
-    if not news_items:
-        return (
-            "🎮 *Sunto notizie*\n\n"
-            "Niente di rilevante nelle ultime ore su Multiplayer.it. "
-            "Il settore respira — o forse stanno tutti preparando qualcosa."
-        )
-
-    news_list = "\n".join(
-        f"{i+1}. {item['title']}" for i, item in enumerate(news_items[:15])
-    )
+    from game_enricher import detect_game_name, enrich_game_data
 
     system = f"""{SOUL_LUCA}
 
-Hai appena controllato Multiplayer.it. Devi fare un sunto rapido delle ultime {hours} ore per chi te lo chiede sul canale Telegram.
+Un utente ti ha scritto nel topic news/videogiochi del canale Telegram.
+Rispondi come faresti in un editoriale: con competenza, opinioni nette e contesto.
 
-Struttura OBBLIGATORIA:
-1. Una riga d'apertura che dice quante notizie ci sono e il tono generale
-2. Le 3-5 notizie più rilevanti con 1-2 frasi di commento ciascuna
-3. Una riga finale opzionale se c'è un tema ricorrente
+Regole:
+- Rispondi direttamente alla domanda senza preamboli
+- Se la domanda riguarda un gioco, porta la tua prospettiva critica
+- Puoi fare riferimenti storici ad altri giochi o momenti dell'industria
+- Lunghezza: 3-6 frasi, mai oltre
+- Formato Telegram: *grassetto* per titoli/nomi importanti
+- Scrivi in italiano"""
 
-Inizia con: 🎮 *Ultime {hours} ore su Multiplayer.it*
-
-Tono: diretto, critico, come faresti in una chat veloce con un collega.
-Lunghezza: 150-250 parole. Scrivi in italiano. Usa *grassetto* per i titoli.
-NON includere link o URL nel testo."""
-
-    return await call_llm(
-        system=system,
-        messages=[{
-            "role": "user",
-            "content": f"Notizie da Multiplayer.it:\n{news_list}"
-        }],
-        max_tokens=500,
+    # Rilevamento gioco e risposta in parallelo — non aspettiamo il game detection
+    # prima di generare la risposta
+    game_name, answer = await asyncio.gather(
+        detect_game_name(question),
+        call_llm(
+            system=system,
+            messages=[{"role": "user", "content": question}],
+            max_tokens=350,
+        ),
     )
 
+    if not game_name:
+        return answer
 
-# ── FORMATTAZIONE ─────────────────────────────────────────────────────────────
+    # Recupera dati esterni
+    logger.info(f"Luca: arricchimento dati per '{game_name}'")
+    game_data = await enrich_game_data(game_name)
+
+    stats_block = game_data.format_for_telegram()
+    return answer + (stats_block if stats_block else "")
+
 
 def format_news_message(title: str, url: str, comment: str) -> str:
     return (
