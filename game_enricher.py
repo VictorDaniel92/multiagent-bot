@@ -402,20 +402,21 @@ async def fetch_psnprofiles(client: httpx.AsyncClient, game_name: str, data: Gam
 async def _fetch_psn_guide(client: httpx.AsyncClient, game_name: str, data: GameData):
     """
     Cerca e scrapa la guida al platino su PSNProfiles.
-    Le guide hanno URL tipo: https://psnprofiles.com/guide/XXXX-game-name
-    e contengono una tabella con: difficulty, time, playthroughs, missable trophies.
     """
-    # Cerca la guida
-    query    = game_name.replace(" ", "+")
+    query        = game_name.replace(" ", "+")
     guide_search = f"https://psnprofiles.com/guides?q={query}"
 
     resp = await _get(client, guide_search)
     if not resp:
+        logger.info(f"PSN Guide: nessuna risposta per '{game_name}'")
         return
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Trova il primo link a una guida
+    # Debug: mostra tutti i link /guide/ trovati
+    all_guide_links = [a["href"] for a in soup.find_all("a", href=True) if "/guide/" in a["href"]]
+    logger.info(f"PSN Guide search '{game_name}': trovati {len(all_guide_links)} link → {all_guide_links[:5]}")
+
     guide_url = None
     for a in soup.find_all("a", href=True):
         href = a["href"]
@@ -424,9 +425,23 @@ async def _fetch_psn_guide(client: httpx.AsyncClient, game_name: str, data: Game
             break
 
     if not guide_url:
-        logger.debug(f"PSNProfiles: nessuna guida trovata per '{game_name}'")
+        # Fallback: prova URL diretto con slug
+        slug      = _slug(game_name)
+        fallback  = f"https://psnprofiles.com/guides?q={slug}"
+        resp2     = await _get(client, fallback)
+        if resp2:
+            soup2 = BeautifulSoup(resp2.text, "html.parser")
+            for a in soup2.find_all("a", href=True):
+                href = a["href"]
+                if "/guide/" in href and href != "/guides":
+                    guide_url = ("https://psnprofiles.com" + href) if href.startswith("/") else href
+                    break
+
+    if not guide_url:
+        logger.info(f"PSN Guide: nessuna guida trovata per '{game_name}'")
         return
 
+    logger.info(f"PSN Guide trovata: {guide_url}")
     data.psn_guide_url = guide_url
 
     # Scrapa la guida
