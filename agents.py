@@ -6,10 +6,6 @@ from search import web_search, format_results
 
 logger = logging.getLogger(__name__)
 
-GROQ_API_KEY = os.environ["GROQ_API_KEY"]
-GROQ_MODEL   = "llama-3.3-70b-versatile"
-GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
-
 SOULS_DIR = Path(__file__).parent / "souls"
 
 
@@ -179,21 +175,103 @@ Rispondi con questo JSON:
 
 # ── LLM BASE ─────────────────────────────────────────────────────────────────
 
+
+# ── PROVIDER CONFIGURATION ────────────────────────────────────────────────────
+
+# Tutti i provider usano l'API OpenAI-compatible.
+# I modelli free-tier sono scelti per qualità/disponibilità.
+# L'ordine determina la priorità: Groq → Cerebras → Together AI
+
+PROVIDERS = [
+    {
+        "name":    "Groq",
+        "url":     "https://api.groq.com/openai/v1/chat/completions",
+        "api_key": os.environ.get("GROQ_API_KEY", ""),
+        "model":   "llama-3.3-70b-versatile",
+    },
+    {
+        "name":    "Cerebras",
+        "url":     "https://api.cerebras.ai/v1/chat/completions",
+        "api_key": os.environ.get("CEREBRAS_API_KEY", ""),
+        "model":   "llama-3.3-70b",
+    },
+    {
+        "name":    "Together AI",
+        "url":     "https://api.together.xyz/v1/chat/completions",
+        "api_key": os.environ.get("TOGETHER_API_KEY", ""),
+        "model":   "meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
+    },
+]
+
+# Errori HTTP che giustificano il fallback al provider successivo
+FALLBACK_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+# ── LLM BASE CON FALLBACK ─────────────────────────────────────────────────────
+
 async def call_llm(system: str, messages: list[dict], max_tokens: int = 1024) -> str:
-    async with httpx.AsyncClient(timeout=60) as client:
-        response = await client.post(
-            GROQ_URL,
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model":      GROQ_MODEL,
-                "max_tokens": max_tokens,
-                "messages":   [{"role": "system", "content": system}] + messages,
-            }
-        )
-        data = response.json()
-        if response.status_code != 200:
-            raise RuntimeError(data.get("error", {}).get("message", "Errore API Groq"))
-        return data["choices"][0]["message"]["content"].strip()
+    """
+    Chiama il primo provider disponibile (Groq → Cerebras → Together AI).
+    Se un provider risponde con rate limit o errore server, prova il successivo.
+    Solleva RuntimeError solo se tutti i provider falliscono.
+    """
+    payload_messages = [{"role": "system", "content": system}] + messages
+    last_error = "Nessun provider configurato"
+
+    for provider in PROVIDERS:
+        if not provider["api_key"]:
+            logger.debug(f"Provider {provider['name']}: API key assente, skip")
+            continue
+
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                response = await client.post(
+                    provider["url"],
+                    headers={
+                        "Authorization": f"Bearer {provider['api_key']}",
+                        "Content-Type":  "application/json",
+                    },
+                    json={
+                        "model":      provider["model"],
+                        "max_tokens": max_tokens,
+                        "messages":   payload_messages,
+                    },
+                )
+
+            if response.status_code == 200:
+                data = response.json()
+                logger.debug(f"LLM: risposta da {provider['name']}")
+                return data["choices"][0]["message"]["content"].strip()
+
+            # Errori che giustificano il fallback
+            if response.status_code in FALLBACK_STATUS_CODES:
+                try:
+                    err_msg = response.json().get("error", {}).get("message", str(response.status_code))
+                except Exception:
+                    err_msg = str(response.status_code)
+                last_error = f"{provider['name']} HTTP {response.status_code}: {err_msg}"
+                logger.warning(f"LLM fallback: {last_error} → provo provider successivo")
+                continue
+
+            # Errori non recuperabili (es. 401 autenticazione)
+            try:
+                err_msg = response.json().get("error", {}).get("message", str(response.status_code))
+            except Exception:
+                err_msg = str(response.status_code)
+            raise RuntimeError(f"{provider['name']} error {response.status_code}: {err_msg}")
+
+        except httpx.TimeoutException:
+            last_error = f"{provider['name']}: timeout"
+            logger.warning(f"LLM fallback: {last_error} → provo provider successivo")
+            continue
+
+        except httpx.ConnectError:
+            last_error = f"{provider['name']}: connessione fallita"
+            logger.warning(f"LLM fallback: {last_error} → provo provider successivo")
+            continue
+
+    raise RuntimeError(f"Tutti i provider LLM non disponibili. Ultimo errore: {last_error}")
+
 
 
 # ── AGENTE MAX ────────────────────────────────────────────────────────────────
