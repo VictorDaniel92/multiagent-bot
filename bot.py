@@ -25,6 +25,7 @@ from memory_vector import (
     search_memories, format_memories_for_prompt,
     get_recent_conversations,
 )
+from webhook_server import start_webhook_server, set_bot_app
 from sophia_agent import (
     sophia_is_mentioned, sophia_route_request, sophia_format_agent_message,
     sophia_welcome, sophia_daily_recap, sophia_agent_status,
@@ -556,6 +557,10 @@ async def post_init(app):
     await init_db()
     await init_news_db()
     await init_vector_db()
+
+    # Avvia il server webhook in parallelo
+    set_bot_app(app)
+    await start_webhook_server()
     await app.bot.set_my_commands([
         BotCommand("start",   "Benvenuto e info"),
         BotCommand("agenti",  "Chi c'è nel gruppo"),
