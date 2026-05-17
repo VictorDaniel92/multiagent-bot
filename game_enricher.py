@@ -131,11 +131,6 @@ def _slug(name: str) -> str:
 # ── STEP 0: RILEVA IL NOME DEL GIOCO DALLA DOMANDA ───────────────────────────
 
 async def detect_game_name(question: str) -> str | None:
-    """
-    Usa il LLM per capire se la domanda riguarda un gioco specifico
-    e restituisce il nome canonico in inglese (per le ricerche).
-    Ritorna None se non c'è un titolo specifico.
-    """
     raw = await call_llm(
         system=(
             "Sei un estrattore di nomi di videogiochi. "
@@ -148,6 +143,7 @@ async def detect_game_name(question: str) -> str | None:
         max_tokens=30,
     )
     name = raw.strip().strip('"').strip("'")
+    logger.info(f"detect_game_name: '{question[:60]}' → '{name}'")
     if name.upper() == "NONE" or not name:
         return None
     return name
