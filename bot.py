@@ -21,7 +21,7 @@ from mentor_agent import (
 )
 from news_agent import (
     fetch_new_multiplayer_news, fetch_recent_news,
-    luca_comment_news, luca_daily_digest, luca_news_summary,
+    luca_comment_news, luca_daily_digest, luca_summarize_recent,
     format_news_message, get_yesterday_news, mark_seen, init_news_db,
     luca_answer_question,
 )
@@ -844,7 +844,7 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
         news_items = await fetch_recent_news(max_items=20)
-        summary    = await luca_news_summary(news_items, hours=4)
+        summary    = await luca_summarize_recent(news_items, hours=4)
         await status.delete()
         await update.message.reply_text(summary, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
