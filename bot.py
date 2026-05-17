@@ -13,6 +13,12 @@ from telegram.constants import ParseMode, ChatAction
 
 from agents import run_pipeline
 from memory import init_db, get_memory, set_memory, update_topics, format_memory_for_prompt
+from session_memory import (
+    init_episode_db, get_or_create_session,
+    add_user_message, add_agent_message,
+    get_session_context, contextual_guard,
+    get_user_episode_pattern, get_today_narrative,
+)
 from mentor_agent import (
     mentor_analyze_agent, mentor_analyze_all,
     format_analysis_for_telegram, ANALYZABLE_AGENTS,
@@ -304,19 +310,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── NEWS (Luca) ────────────────────────────────────────────────────────
     if topic == "news":
-        from agents import call_llm
-        import json as _json
-        guard_result = await call_llm(
-            system='Classificatore. La domanda riguarda videogiochi/gaming/industria videoludica? Rispondi SOLO con JSON: {"ok": true} oppure {"ok": false}',
-            messages=[{"role": "user", "content": f"Domanda: {question}"}],
-            max_tokens=20
+        # Guard contestuale — passa il contesto della sessione
+        session_ctx  = await get_session_context(user_id, "news", max_messages=3)
+        guard_result = await contextual_guard(
+            question, "news", user_id,
+            "videogiochi, gaming, industria videoludica"
         )
-        try:
-            ok = _json.loads(guard_result.strip()).get("ok", True)
-        except Exception:
-            ok = True
-
-        if not ok:
+        if not guard_result["ok"]:
             await message.reply_text(
                 "🎮 Questo topic è dedicato ai *videogiochi* e all'industria gaming.\n\n"
                 "Per altre domande usa il topic giusto:\n"
@@ -325,17 +325,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        await add_user_message(user_id, "news", question)
         status_msg = await message.reply_text("🎮 *Luca* sta pensando...", parse_mode=ParseMode.MARKDOWN)
         try:
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-            profile        = await get_profile(user_id)
-            profile_ctx    = format_profile_for_prompt(profile)
+            profile     = await get_profile(user_id)
+            profile_ctx = format_profile_for_prompt(profile)
             answer = await luca_answer_question(question, profile_context=profile_ctx)
             await status_msg.delete()
             await message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
             mark_message_answered(message.message_id)
             await save_conversation(user_id=user_id, topic="news", agent="luca",
                                     question=question, answer=answer)
+            await add_agent_message(user_id, "news", answer[:300], agent="luca")
             if os.environ.get("ENABLE_CROSS_AGENT", "false").lower() == "true":
                 asyncio.create_task(sophia_check_cross_agent_link(
                     context.bot, GROUP_CHAT_ID, "luca", "news", question, answer
@@ -347,19 +349,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── METEO (Giorgio) ────────────────────────────────────────────────────
     if topic == "meteo":
-        from agents import call_llm
-        import json as _json
-        guard_result = await call_llm(
-            system='Classificatore. La domanda riguarda meteo/tempo atmosferico/previsioni? Rispondi SOLO con JSON: {"ok": true} oppure {"ok": false}',
-            messages=[{"role": "user", "content": f"Domanda: {question}"}],
-            max_tokens=20
+        guard_result = await contextual_guard(
+            question, "meteo", user_id,
+            "meteo, tempo atmosferico, previsioni, temperatura, pioggia"
         )
-        try:
-            ok = _json.loads(guard_result.strip()).get("ok", True)
-        except Exception:
-            ok = True
-
-        if not ok:
+        if not guard_result["ok"]:
             await message.reply_text(
                 "🌤️ Questo topic è dedicato al *meteo*.\n\n"
                 "Chiedimi il tempo di una città, es: _\"che tempo fa a Roma?\"_\n\n"
@@ -368,6 +362,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        await add_user_message(user_id, "meteo", question)
         status_msg = await message.reply_text("🌤️ *Giorgio* sta controllando le previsioni...", parse_mode=ParseMode.MARKDOWN)
         try:
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
@@ -385,6 +380,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mark_message_answered(message.message_id)
             await save_conversation(user_id=user_id, topic="meteo", agent="giorgio",
                                     question=question, answer=answer)
+            await add_agent_message(user_id, "meteo", answer[:300], agent="giorgio")
         except Exception as e:
             logger.error(f"Errore Giorgio: {e}", exc_info=True)
             await status_msg.edit_text("⚠️ Errore meteo. Riprova tra qualche secondo.")
@@ -434,7 +430,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.edit_text("⚠️ Errore. Riprova tra qualche secondo.")
         return
     from agents import topic_guard
-    guard = await topic_guard(question, topic)
+
+    # Recupera il contesto della sessione per questo utente+topic
+    session_ctx = await get_session_context(user_id, topic, max_messages=3)
+
+    guard = await topic_guard(question, topic, session_context=session_ctx)
     if not guard["match"]:
         suggested_emoji = TOPIC_EMOJI.get(guard["suggested"], "💬")
         await message.reply_text(
@@ -447,6 +447,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Traccia il messaggio utente nella sessione episodica
+    await add_user_message(user_id, topic, question)
+
     # ── PIPELINE GENERALE ─────────────────────────────────────────────────
     # Carica profilo ricco — sostituisce il vecchio format_memory_for_prompt
     profile        = await get_profile(user_id)
@@ -456,6 +459,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     past_memories = await search_memories(question, user_id=user_id, topic=topic, limit=3)
     if past_memories:
         memory_context += "\n\n" + format_memories_for_prompt(past_memories)
+
+    # Integra con pattern episodici (comportamento a lungo termine)
+    episode_pattern = await get_user_episode_pattern(user_id, days=14)
+    if episode_pattern:
+        memory_context += f"\n\n## Pattern comportamentali recenti\n{episode_pattern}"
 
     status_msg = await message.reply_text(f"⏳ Avvio pipeline {emoji}...")
 
@@ -482,8 +490,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             answer=result["answer"],
         )
 
+        # Traccia la risposta nella sessione episodica
+        await add_agent_message(user_id, topic, result["answer"][:300], agent="alex")
+
         # Aggiornamento automatico profilo (silenzioso, non blocca)
-        # Non aggiorna il profilo dell'owner che è manuale
         import asyncio as _asyncio
         _asyncio.ensure_future(
             auto_update_profile(user_id, update.effective_user.first_name, question, topic)
@@ -605,6 +615,19 @@ async def cmd_profilo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("\n_Profilo costruito automaticamente_")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_oggi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sophia ricostruisce la sequenza narrativa delle conversazioni di oggi."""
+    user_id    = update.effective_user.id
+    status_msg = await update.message.reply_text("🌸 *Sophia* sta ricostruendo la tua giornata...", parse_mode=ParseMode.MARKDOWN)
+    try:
+        narrative = await get_today_narrative(user_id)
+        await status_msg.delete()
+        await update.message.reply_text(narrative, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"Errore /oggi: {e}")
+        await status_msg.edit_text("⚠️ Errore nel recupero delle conversazioni.")
 
 
 async def cmd_nota(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -950,6 +973,7 @@ async def post_init(app):
     await init_news_db()
     await init_vector_db()
     await init_profiles_db()
+    await init_episode_db()
 
     # Avvia il server webhook in parallelo
     set_bot_app(app)
@@ -960,6 +984,7 @@ async def post_init(app):
         BotCommand("profilo", "Il tuo profilo utente"),
         BotCommand("memoria", "Cosa ricordo di te"),
         BotCommand("nota",    "Aggiungi una nota su di te"),
+        BotCommand("oggi",    "Riassunto narrativo della giornata"),
         BotCommand("dietro",  "Toggle ragionamento interno"),
         BotCommand("news",    "Ultime notizie gaming"),
         BotCommand("mentor",  "Analisi e miglioramento agenti"),
@@ -1009,6 +1034,7 @@ def main():
     app.add_handler(CommandHandler("agenti",  cmd_agenti))
     app.add_handler(CommandHandler("memoria", cmd_memoria))
     app.add_handler(CommandHandler("profilo", cmd_profilo))
+    app.add_handler(CommandHandler("oggi",    cmd_oggi))
     app.add_handler(CommandHandler("nota",    cmd_nota))
     app.add_handler(CommandHandler("dietro",  cmd_dietro))
     app.add_handler(CommandHandler("news",    cmd_news))

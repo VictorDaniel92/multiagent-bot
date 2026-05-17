@@ -118,9 +118,10 @@ TOPIC_DESCRIPTIONS = {
     "news":          "notizie videogiochi, gaming, recensioni, annunci, industria videoludica",
 }
 
-async def topic_guard(question: str, current_topic: str) -> dict:
+async def topic_guard(question: str, current_topic: str, session_context: str = "") -> dict:
     """
     Verifica se la domanda è coerente col topic attuale.
+    Ora accetta il contesto della sessione per valutare domande di follow-up.
     Ritorna {"match": bool, "suggested": str, "reason": str}
     """
     if current_topic not in TOPIC_DESCRIPTIONS:
@@ -130,12 +131,23 @@ async def topic_guard(question: str, current_topic: str) -> dict:
         f'- "{t}": {desc}' for t, desc in TOPIC_DESCRIPTIONS.items()
     )
 
+    context_block = ""
+    if session_context:
+        context_block = f"""
+Contesto della conversazione recente in questo topic:
+{session_context}
+
+IMPORTANTE: se la domanda sembra un follow-up al contesto sopra (es. "quanto dura?",
+"e quello?", "perché?", "mi puoi dire di più?"), considerala nel topic anche se
+presa da sola sembrerebbe fuori contesto.
+"""
+
     system = """Sei un classificatore di messaggi per un bot Telegram multi-topic.
 Il tuo unico compito è capire se una domanda è nel topic giusto.
 Rispondi SOLO con JSON valido, nessun testo aggiuntivo."""
 
     prompt = f"""Topic attuale: "{current_topic}" ({TOPIC_DESCRIPTIONS[current_topic]})
-
+{context_block}
 Topic disponibili:
 {topic_list}
 
@@ -144,7 +156,7 @@ Domanda dell'utente: "{question}"
 Rispondi con questo JSON:
 {{"match": true/false, "suggested": "topic_più_adatto", "reason": "breve spiegazione in italiano"}}
 
-- match: true se la domanda è ragionevolmente nel topic attuale (anche parzialmente)
+- match: true se la domanda è ragionevolmente nel topic attuale (anche parzialmente o come follow-up)
 - suggested: il topic più adatto tra {list(TOPIC_DESCRIPTIONS.keys())}
 - Se match è true, suggested può essere uguale al topic attuale"""
 
@@ -162,7 +174,6 @@ Rispondi con questo JSON:
             "reason":    data.get("reason", ""),
         }
     except Exception:
-        # In caso di errore di parsing, lascia passare
         return {"match": True, "suggested": current_topic, "reason": ""}
 
 
