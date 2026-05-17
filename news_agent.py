@@ -391,9 +391,34 @@ async def luca_answer_question(question: str, profile_context: str = "") -> str:
     """
     Luca risponde a una domanda libera nel topic news.
     Se la domanda riguarda un gioco specifico, arricchisce la risposta
-    con dati da Metacritic, Multiplayer.it, HowLongToBeat e PSNProfiles.
+    con dati da Metacritic, Multiplayer.it, HowLongToBeat e PSNProfiles,
+    e usa il testo della recensione di Multiplayer.it come contesto.
     """
     from game_enricher import detect_game_name, enrich_game_data
+
+    # Rilevamento gioco e risposta base in parallelo
+    game_name, _ = await asyncio.gather(
+        detect_game_name(question),
+        asyncio.sleep(0),  # placeholder per gather
+    )
+
+    # Se c'è un gioco specifico, arricchisce prima di rispondere
+    review_context = ""
+    stats_block    = ""
+
+    if game_name:
+        logger.info(f"Luca: arricchimento dati per '{game_name}'")
+        game_data = await enrich_game_data(game_name)
+        stats_block = game_data.format_for_telegram()
+
+        # Inietta il testo della recensione come contesto per il LLM
+        if game_data.multiplayer_review_text:
+            review_context = (
+                f"\n\n## Recensione di Multiplayer.it per {game_name}:\n"
+                f"{game_data.multiplayer_review_text}\n\n"
+                f"Usa questa recensione come base per la tua risposta — "
+                f"puoi citare aspetti specifici, concordare o dissentire con giudizio critico."
+            )
 
     system = f"""{SOUL_LUCA}
 
@@ -404,31 +429,18 @@ Rispondi come faresti in un editoriale: con competenza, opinioni nette e contest
 
 Regole:
 - Rispondi direttamente alla domanda senza preamboli
-- Se la domanda riguarda un gioco, porta la tua prospettiva critica
+- Se hai la recensione di Multiplayer.it, usala come base ma esprimi la TUA voce critica
 - Puoi fare riferimenti storici ad altri giochi o momenti dell'industria
 - Lunghezza: 3-6 frasi, mai oltre
 - Formato Telegram: *grassetto* per titoli/nomi importanti
-- Scrivi in italiano"""
+- Scrivi in italiano{review_context}"""
 
-    # Rilevamento gioco e risposta in parallelo — non aspettiamo il game detection
-    # prima di generare la risposta
-    game_name, answer = await asyncio.gather(
-        detect_game_name(question),
-        call_llm(
-            system=system,
-            messages=[{"role": "user", "content": question}],
-            max_tokens=350,
-        ),
+    answer = await call_llm(
+        system=system,
+        messages=[{"role": "user", "content": question}],
+        max_tokens=350,
     )
 
-    if not game_name:
-        return answer
-
-    # Recupera dati esterni
-    logger.info(f"Luca: arricchimento dati per '{game_name}'")
-    game_data = await enrich_game_data(game_name)
-
-    stats_block = game_data.format_for_telegram()
     return answer + (stats_block if stats_block else "")
 
 

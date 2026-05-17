@@ -41,6 +41,7 @@ class GameData:
     metacritic_user:  str = ""   # "8.4"       o ""
     multiplayer_vote: str = ""   # "9.2"       o ""
     multiplayer_url:  str = ""
+    multiplayer_review_text: str = ""  # testo recensione completo
     hltb_main:        str = ""   # "30 ore"    o ""
     hltb_complete:    str = ""   # "80 ore"    o ""
     psn_difficulty:   str = ""   # "4/10"      o ""
@@ -385,11 +386,73 @@ async def fetch_psnprofiles(client: httpx.AsyncClient, game_name: str, data: Gam
     logger.debug(f"PSNProfiles: {game_name} → {data.psn_difficulty}, {data.psn_completion}")
 
 
+# ── SCRAPER 5: TESTO RECENSIONE MULTIPLAYER.IT ───────────────────────────────
+
+async def fetch_multiplayer_review_text(client: httpx.AsyncClient, game_name: str, data: GameData) -> str:
+    """
+    Recupera il testo completo della recensione di Multiplayer.it per un gioco.
+    Ritorna il testo estratto (max ~2000 chars) o stringa vuota se non trovato.
+    """
+    query = game_name.replace(" ", "+")
+    url   = f"https://multiplayer.it/cerca/?q={query}"
+
+    resp = await _get(client, url)
+    if not resp:
+        return ""
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Trova il link alla recensione
+    review_url = None
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/recensioni/" in href:
+            review_url = ("https://multiplayer.it" + href) if href.startswith("/") else href
+            break
+
+    if not review_url:
+        logger.debug(f"Multiplayer.it: nessuna recensione trovata per '{game_name}'")
+        return ""
+
+    resp2 = await _get(client, review_url)
+    if not resp2:
+        return ""
+
+    soup2 = BeautifulSoup(resp2.text, "html.parser")
+
+    # Estrae il corpo della recensione — cerca i tag più probabili
+    body = (
+        soup2.find("div", class_=re.compile(r"article.?body|review.?body|content.?text|article.?content", re.I))
+        or soup2.find("article")
+        or soup2.find("div", class_=re.compile(r"text|body|content", re.I))
+    )
+
+    if not body:
+        return ""
+
+    # Rimuove script, style, nav
+    for tag in body.find_all(["script", "style", "nav", "aside", "figure"]):
+        tag.decompose()
+
+    text = body.get_text(" ", strip=True)
+
+    # Pulisce spazi multipli
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # Limita a 2500 caratteri per non esplodere il contesto
+    if len(text) > 2500:
+        text = text[:2500] + "..."
+
+    logger.debug(f"Multiplayer.it review text: {game_name} → {len(text)} chars")
+    return text
+
+
 # ── ENTRY POINT PRINCIPALE ────────────────────────────────────────────────────
 
 async def enrich_game_data(game_name: str) -> GameData:
     """
     Recupera tutti i dati disponibili per un gioco in parallelo.
+    Include voti, tempi di completamento, difficoltà platino e testo recensione.
     """
     data = GameData(name=game_name)
 
@@ -398,12 +461,19 @@ async def enrich_game_data(game_name: str) -> GameData:
         follow_redirects=True,
         timeout=TIMEOUT,
     ) as client:
-        await asyncio.gather(
+        review_text_task = fetch_multiplayer_review_text(client, game_name, data)
+
+        results = await asyncio.gather(
             fetch_metacritic(client, game_name, data),
             fetch_multiplayer(client, game_name, data),
             fetch_hltb(client, game_name, data),
             fetch_psnprofiles(client, game_name, data),
+            review_text_task,
             return_exceptions=True,
         )
+
+        # Il 5° risultato è il testo della recensione
+        if isinstance(results[4], str) and results[4]:
+            data.multiplayer_review_text = results[4]
 
     return data
