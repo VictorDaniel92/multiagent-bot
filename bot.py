@@ -769,6 +769,31 @@ async def _run_mentor_for_agent(
     )
 
 
+async def cmd_mentor_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/mentor_debug — mostra quante conversazioni ci sono nel DB per agente."""
+    from memory_vector import _pool
+    if not _pool:
+        await update.message.reply_text("❌ Vector DB non disponibile.")
+        return
+    try:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT agent, COUNT(*) as n, MAX(created_at) as last
+                FROM conversations
+                GROUP BY agent
+                ORDER BY n DESC
+            """)
+        if not rows:
+            await update.message.reply_text("📭 Tabella `conversations` vuota.")
+            return
+        lines = ["📊 *Conversazioni nel DB per agente:*\n"]
+        for r in rows:
+            lines.append(f"• `{r['agent']}`: {r['n']} conversazioni (ultima: {str(r['last'])[:16]})")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Errore query: {e}")
+
+
 async def cmd_mentor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /mentor          → analizza tutti gli agenti
@@ -1104,7 +1129,8 @@ def main():
     app.add_handler(CommandHandler("nota",    cmd_nota))
     app.add_handler(CommandHandler("dietro",  cmd_dietro))
     app.add_handler(CommandHandler("news",    cmd_news))
-    app.add_handler(CommandHandler("mentor",  cmd_mentor))
+    app.add_handler(CommandHandler("mentor",       cmd_mentor))
+    app.add_handler(CommandHandler("mentor_debug", cmd_mentor_debug))
     app.add_handler(CallbackQueryHandler(handle_mentor_callback, pattern=r"^mentor_"))
 
     # Benvenuto nuovi membri

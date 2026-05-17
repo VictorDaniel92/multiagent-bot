@@ -193,7 +193,7 @@ PROVIDERS = [
         "name":    "Cerebras",
         "url":     "https://api.cerebras.ai/v1/chat/completions",
         "api_key": os.environ.get("CEREBRAS_API_KEY", ""),
-        "model":   "llama-3.3-70b",
+        "model":   "llama3.3-70b",   # nome corretto senza trattino dopo llama
     },
     {
         "name":    "Together AI",
@@ -204,7 +204,8 @@ PROVIDERS = [
 ]
 
 # Errori HTTP che giustificano il fallback al provider successivo
-FALLBACK_STATUS_CODES = {429, 500, 502, 503, 504}
+# 404 incluso: può indicare modello non trovato su quel provider
+FALLBACK_STATUS_CODES = {404, 429, 500, 502, 503, 504}
 
 
 # ── LLM BASE CON FALLBACK ─────────────────────────────────────────────────────
