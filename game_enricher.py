@@ -396,6 +396,8 @@ async def _scrape_psn_guide(client: httpx.AsyncClient, guide_url: str, data: Gam
         logger.info(f"PSN Guide: impossibile scrapare {guide_url}")
         return
 
+    logger.info(f"PSN Guide HTTP {resp.status_code} — primi 800 chars: {resp.text[:800]!r}")
+
     soup = BeautifulSoup(resp.text, "html.parser")
 
     field_map = {
