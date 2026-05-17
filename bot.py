@@ -1,12 +1,13 @@
 import os
 import re
+import uuid
 import asyncio
 import logging
 import datetime
-from telegram import Update, BotCommand, ChatMemberUpdated
+from telegram import Update, BotCommand, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler,
-    ChatMemberHandler, filters, ContextTypes
+    ChatMemberHandler, CallbackQueryHandler, filters, ContextTypes
 )
 from telegram.constants import ParseMode, ChatAction
 
@@ -15,6 +16,8 @@ from memory import init_db, get_memory, set_memory, update_topics, format_memory
 from mentor_agent import (
     mentor_analyze_agent, mentor_analyze_all,
     format_analysis_for_telegram, ANALYZABLE_AGENTS,
+    mentor_extract_proposed_soul, apply_soul_change,
+    reload_agent_soul, restore_soul_backup,
 )
 from news_agent import (
     fetch_new_multiplayer_news, fetch_recent_news,
@@ -126,6 +129,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id   = update.effective_chat.id
     topic     = get_topic(update)
     thread_id = getattr(message, "message_thread_id", None)
+
+    # ── GESTIONE MODIFICA SOUL (risposta al flusso ✏️ Modifica del Mentor) ──
+    pending_edit = context.user_data.get("pending_mentor_edit")
+    if pending_edit:
+        if question.strip().lower() == "/annulla":
+            context.user_data.pop("pending_mentor_edit", None)
+            await message.reply_text("❌ Modifica annullata. Il soul rimane invariato.")
+            return
+
+        agent_name   = pending_edit["agent"]
+        proposal_id  = pending_edit["proposal_id"]
+        new_soul     = question.strip()
+
+        ok_write  = apply_soul_change(agent_name, new_soul)
+        ok_reload = reload_agent_soul(agent_name) if ok_write else False
+
+        context.user_data.pop("pending_mentor_edit", None)
+        context.application.bot_data.get("mentor_proposals", {}).pop(proposal_id, None)
+
+        if ok_write and ok_reload:
+            await message.reply_text(
+                f"✅ *Soul di {agent_name.capitalize()} aggiornato con la tua versione e ricaricato.*",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            await message.reply_text("⚠️ Errore durante la scrittura. Riprova.")
+        return
+    # ─────────────────────────────────────────────────────────────────────────
 
     # Logga attività per il recap serale
     sophia_log_activity(topic)
@@ -604,17 +635,61 @@ async def cmd_agenti(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+def _mentor_keyboard(agent_name: str, proposal_id: str) -> InlineKeyboardMarkup:
+    """Tastiera inline per approvare/modificare/rifiutare una proposta del Mentor."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Applica",  callback_data=f"mentor_apply:{agent_name}:{proposal_id}"),
+        InlineKeyboardButton("✏️ Modifica", callback_data=f"mentor_edit:{agent_name}:{proposal_id}"),
+        InlineKeyboardButton("❌ Rifiuta",  callback_data=f"mentor_reject:{agent_name}:{proposal_id}"),
+    ]])
+
+
+async def _run_mentor_for_agent(
+    agent_name: str, limit: int,
+    reply_fn,           # coroutine per inviare il messaggio di analisi
+    bot_data: dict,
+) -> None:
+    """
+    Analizza un agente, estrae la proposta, la salva in bot_data
+    e invia il report con i bottoni inline.
+    """
+    from agents import load_soul
+
+    report = await mentor_analyze_agent(agent_name, limit=limit)
+    analysis_text = format_analysis_for_telegram(report)
+
+    # Estrae la proposta di soul completo
+    current_soul  = load_soul(agent_name)
+    proposed_soul = await mentor_extract_proposed_soul(
+        agent_name, report["analysis"], current_soul
+    )
+
+    # Salva la proposta in bot_data con ID univoco
+    proposal_id = uuid.uuid4().hex[:8]
+    bot_data.setdefault("mentor_proposals", {})[proposal_id] = {
+        "agent":         agent_name,
+        "proposed_soul": proposed_soul,
+        "analysis":      report["analysis"],
+    }
+
+    keyboard = _mentor_keyboard(agent_name, proposal_id)
+    await reply_fn(
+        text=analysis_text + f"\n\n_ID proposta: `{proposal_id}`_",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=keyboard,
+    )
+
+
 async def cmd_mentor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /mentor          → analizza tutti gli agenti
     /mentor alex     → analizza solo Alex
     /mentor alex 30  → analizza Alex sulle ultime 30 conversazioni
     """
-    args        = context.args or []
-    agent_name  = args[0].lower() if args else None
-    limit       = int(args[1]) if len(args) > 1 and args[1].isdigit() else 20
+    args       = context.args or []
+    agent_name = args[0].lower() if args else None
+    limit      = int(args[1]) if len(args) > 1 and args[1].isdigit() else 20
 
-    # Valida agente se specificato
     if agent_name and agent_name not in ANALYZABLE_AGENTS:
         nomi = ", ".join(f"`{a}`" for a in ANALYZABLE_AGENTS)
         await update.message.reply_text(
@@ -623,58 +698,135 @@ async def cmd_mentor(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if agent_name:
-        status = await update.message.reply_text(
-            f"🧠 *Mentor* sta analizzando *{agent_name.capitalize()}*\n"
-            f"_(ultime {limit} conversazioni)_",
-            parse_mode=ParseMode.MARKDOWN,
+    agents_to_run = [agent_name] if agent_name else list(ANALYZABLE_AGENTS.keys())
+
+    status = await update.message.reply_text(
+        f"🧠 *Mentor* sta analizzando: {', '.join(agents_to_run)}\n"
+        f"_(ultime {limit} conversazioni per agente)_",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    try:
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id, action=ChatAction.TYPING
         )
-        try:
-            await context.bot.send_chat_action(
-                chat_id=update.effective_chat.id, action=ChatAction.TYPING
+        await status.delete()
+
+        for name in agents_to_run:
+            await _run_mentor_for_agent(
+                agent_name=name,
+                limit=limit,
+                reply_fn=update.message.reply_text,
+                bot_data=context.application.bot_data,
             )
-            report = await mentor_analyze_agent(agent_name, limit=limit)
-            await status.delete()
-            msg = format_analysis_for_telegram(report)
-            await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-        except Exception as e:
-            logger.error(f"Errore /mentor {agent_name}: {e}", exc_info=True)
-            await status.edit_text("⚠️ Errore durante l'analisi. Riprova.")
-    else:
-        status = await update.message.reply_text(
-            f"🧠 *Mentor* sta analizzando tutti gli agenti...\n"
-            f"_(ultime {limit} conversazioni ciascuno — potrebbe richiedere qualche minuto)_",
+
+    except Exception as e:
+        logger.error(f"Errore /mentor: {e}", exc_info=True)
+        await update.message.reply_text("⚠️ Errore durante l'analisi. Riprova.")
+
+
+async def handle_mentor_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Gestisce i bottoni inline ✅ Applica / ✏️ Modifica / ❌ Rifiuta
+    """
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data  # formato: mentor_apply:alex:abc12345
+    parts = data.split(":")
+    if len(parts) != 3:
+        return
+
+    action, agent_name, proposal_id = parts
+    proposals = context.application.bot_data.get("mentor_proposals", {})
+    proposal  = proposals.get(proposal_id)
+
+    if not proposal:
+        await query.edit_message_text(
+            "⚠️ Proposta non trovata o scaduta. Riesegui `/mentor`.",
             parse_mode=ParseMode.MARKDOWN,
         )
-        try:
-            reports = await mentor_analyze_all(limit=limit)
-            await status.delete()
-            for report in reports:
-                msg = format_analysis_for_telegram(report)
-                await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-        except Exception as e:
-            logger.error(f"Errore /mentor all: {e}", exc_info=True)
-            await status.edit_text("⚠️ Errore durante l'analisi. Riprova.")
+        return
+
+    # ── ✅ APPLICA ────────────────────────────────────────────────────────────
+    if action == "mentor_apply":
+        ok_write  = apply_soul_change(agent_name, proposal["proposed_soul"])
+        ok_reload = reload_agent_soul(agent_name) if ok_write else False
+
+        if ok_write and ok_reload:
+            await query.edit_message_text(
+                f"✅ *Soul di {agent_name.capitalize()} aggiornato e ricaricato in memoria.*\n\n"
+                f"Il backup del soul precedente è in `souls/{agent_name}.bak.md`.\n"
+                f"Usa `/mentor {agent_name}` tra qualche giorno per verificare i miglioramenti.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        elif ok_write and not ok_reload:
+            await query.edit_message_text(
+                f"⚠️ Soul scritto su disco ma *non ricaricato in memoria*.\n"
+                f"L'agente {agent_name} userà il nuovo soul solo dopo il prossimo restart.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            await query.edit_message_text(
+                f"❌ Errore durante la scrittura del soul di {agent_name}. Riprova.",
+            )
+
+        # Rimuovi la proposta dalla memoria
+        proposals.pop(proposal_id, None)
+
+    # ── ✏️ MODIFICA ───────────────────────────────────────────────────────────
+    elif action == "mentor_edit":
+        # Invia il soul proposto come testo, chiede all'utente di modificarlo e rimandarlo
+        await query.edit_message_text(
+            f"✏️ *Modifica il soul di {agent_name.capitalize()}*\n\n"
+            f"Copia il testo qui sotto, modifica quello che vuoi e rimandamelo "
+            f"come risposta in questa chat. Scrivi `/annulla` per annullare.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        # Invia il soul proposto come messaggio separato (più facile da copiare)
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"```\n{proposal['proposed_soul']}\n```",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        # Salva stato di attesa modifica in user_data
+        context.user_data["pending_mentor_edit"] = {
+            "agent":       agent_name,
+            "proposal_id": proposal_id,
+        }
+
+    # ── ❌ RIFIUTA ────────────────────────────────────────────────────────────
+    elif action == "mentor_reject":
+        await query.edit_message_text(
+            f"❌ *Proposta per {agent_name.capitalize()} rifiutata.*\n"
+            f"Il soul rimane invariato.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        proposals.pop(proposal_id, None)
 
 
 async def job_mentor_weekly(context):
-    """
-    Job domenicale: analizza tutti gli agenti e invia il report nel gruppo.
-    Attivato se ENABLE_MENTOR_JOB=true nelle variabili d'ambiente.
-    """
+    """Job domenicale: analizza tutti gli agenti e invia i report nel gruppo."""
     if not GROUP_CHAT_ID:
         logger.warning("GROUP_CHAT_ID non configurato — skip job mentor")
         return
 
     logger.info("Job mentor settimanale avviato")
     try:
-        reports = await mentor_analyze_all(limit=20)
-        for report in reports:
-            msg = format_analysis_for_telegram(report)
+        async def send_to_group(text, parse_mode, reply_markup=None):
             await context.bot.send_message(
                 chat_id=GROUP_CHAT_ID,
-                text=msg,
-                parse_mode=ParseMode.MARKDOWN,
+                text=text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            )
+
+        for name in ANALYZABLE_AGENTS:
+            await _run_mentor_for_agent(
+                agent_name=name,
+                limit=20,
+                reply_fn=send_to_group,
+                bot_data=context.application.bot_data,
             )
     except Exception as e:
         logger.error(f"Errore job mentor: {e}", exc_info=True)
@@ -860,6 +1012,7 @@ def main():
     app.add_handler(CommandHandler("dietro",  cmd_dietro))
     app.add_handler(CommandHandler("news",    cmd_news))
     app.add_handler(CommandHandler("mentor",  cmd_mentor))
+    app.add_handler(CallbackQueryHandler(handle_mentor_callback, pattern=r"^mentor_"))
 
     # Benvenuto nuovi membri
     app.add_handler(ChatMemberHandler(handle_new_member, ChatMemberHandler.CHAT_MEMBER))

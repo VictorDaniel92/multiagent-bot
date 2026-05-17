@@ -33,6 +33,43 @@ SOUL_ALEX  = load_soul("alex")
 SOUL_USER  = load_soul("user")
 
 
+def reload_soul(name: str) -> bool:
+    """
+    Ricarica un soul dal filesystem e aggiorna il global corrispondente.
+    Chiamato dal Mentor dopo aver applicato una modifica al soul.md.
+    Ritorna True se il reload è riuscito, False altrimenti.
+    """
+    global SOUL_MAX, SOUL_SOFIA, SOUL_ALEX, SOUL_USER
+
+    new_content = load_soul(name)
+    if not new_content:
+        logger.error(f"reload_soul: impossibile ricaricare '{name}' — file vuoto o mancante")
+        return False
+
+    mapping = {
+        "max":   "SOUL_MAX",
+        "sofia": "SOUL_SOFIA",
+        "alex":  "SOUL_ALEX",
+        "user":  "SOUL_USER",
+    }
+
+    if name not in mapping:
+        logger.warning(f"reload_soul: '{name}' non ha un global dedicato, nessun reload in memoria")
+        return True  # il file è stato scritto, anche se non c'è global da aggiornare
+
+    if name == "max":
+        SOUL_MAX = new_content
+    elif name == "sofia":
+        SOUL_SOFIA = new_content
+    elif name == "alex":
+        SOUL_ALEX = new_content
+    elif name == "user":
+        SOUL_USER = new_content
+
+    logger.info(f"Soul '{name}' ricaricato in memoria ✅ ({len(new_content)} chars)")
+    return True
+
+
 # ── PIPELINE PER TOPIC ────────────────────────────────────────────────────────
 
 # Ogni topic ha una configurazione diversa che cambia il comportamento degli agenti

@@ -177,7 +177,91 @@ async def mentor_analyze_all(limit: int = 15) -> list[dict]:
     return reports
 
 
-# ── FORMATTAZIONE MESSAGGIO TELEGRAM ─────────────────────────────────────────
+# ── STEP 2: ESTRAZIONE E APPLICAZIONE PROPOSTA ───────────────────────────────
+
+async def mentor_extract_proposed_soul(
+    agent_name: str, analysis: str, current_soul: str
+) -> str:
+    """
+    Partendo dall'analisi già fatta, genera il testo COMPLETO del nuovo soul.md.
+    Questo è ciò che verrà scritto su disco se l'utente approva.
+    """
+    system = f"""{SOUL_MENTOR}
+
+Hai appena prodotto un'analisi dell'agente {agent_name}.
+Ora devi generare il testo COMPLETO e AGGIORNATO del soul.md dell'agente,
+applicando le modifiche proposte nell'analisi.
+
+Regole:
+- Restituisci SOLO il testo del nuovo soul.md, senza preamboli né spiegazioni
+- Mantieni la struttura Markdown (titoli ##, liste -)
+- Applica SOLO le modifiche proposte nella sezione "Proposta di modifica"
+- Tutto il resto del soul deve rimanere invariato
+- Non aggiungere sezioni non presenti nell'originale"""
+
+    return await call_llm(
+        system=system,
+        messages=[{
+            "role": "user",
+            "content": (
+                f"Soul attuale di {agent_name}:\n```\n{current_soul}\n```\n\n"
+                f"Analisi e proposta di modifica:\n{analysis}"
+            )
+        }],
+        max_tokens=1200,
+    )
+
+
+def apply_soul_change(agent_name: str, new_soul_content: str) -> bool:
+    """
+    Scrive il nuovo soul.md su disco.
+    Fa un backup del file precedente come soul_name.bak.md.
+    Ritorna True se riuscito.
+    """
+    soul_path = SOULS_DIR / f"{agent_name}.md"
+    bak_path  = SOULS_DIR / f"{agent_name}.bak.md"
+
+    try:
+        # Backup del soul precedente
+        if soul_path.exists():
+            bak_path.write_text(soul_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+        soul_path.write_text(new_soul_content.strip(), encoding="utf-8")
+        logger.info(f"Soul '{agent_name}' scritto su disco ✅")
+        return True
+
+    except Exception as e:
+        logger.error(f"Errore scrittura soul '{agent_name}': {e}")
+        return False
+
+
+def reload_agent_soul(agent_name: str) -> bool:
+    """
+    Ricarica il soul in memoria (aggiorna i global in agents.py).
+    Da chiamare subito dopo apply_soul_change.
+    """
+    from agents import reload_soul
+    return reload_soul(agent_name)
+
+
+def restore_soul_backup(agent_name: str) -> bool:
+    """Ripristina il backup del soul in caso di rollback."""
+    soul_path = SOULS_DIR / f"{agent_name}.md"
+    bak_path  = SOULS_DIR / f"{agent_name}.bak.md"
+
+    if not bak_path.exists():
+        logger.warning(f"Nessun backup disponibile per '{agent_name}'")
+        return False
+
+    try:
+        soul_path.write_text(bak_path.read_text(encoding="utf-8"), encoding="utf-8")
+        reload_agent_soul(agent_name)
+        logger.info(f"Soul '{agent_name}' ripristinato dal backup ✅")
+        return True
+    except Exception as e:
+        logger.error(f"Errore ripristino backup '{agent_name}': {e}")
+        return False
+
 
 def format_analysis_for_telegram(report: dict) -> str:
     """
