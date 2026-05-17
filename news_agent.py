@@ -387,7 +387,7 @@ Regole:
 
 # ── FORMATTAZIONE ─────────────────────────────────────────────────────────────
 
-async def luca_answer_question(question: str) -> str:
+async def luca_answer_question(question: str, profile_context: str = "") -> str:
     """
     Luca risponde a una domanda libera nel topic news.
     Se la domanda riguarda un gioco specifico, arricchisce la risposta
@@ -396,6 +396,8 @@ async def luca_answer_question(question: str) -> str:
     from game_enricher import detect_game_name, enrich_game_data
 
     system = f"""{SOUL_LUCA}
+
+{profile_context}
 
 Un utente ti ha scritto nel topic news/videogiochi del canale Telegram.
 Rispondi come faresti in un editoriale: con competenza, opinioni nette e contesto.
