@@ -163,6 +163,8 @@ async def fetch_new_multiplayer_news(max_items: int = 30) -> list[dict]:
 # ── AGENTE LUCA ───────────────────────────────────────────────────────────────
 
 async def luca_comment_news(title: str, url: str) -> str:
+    thread_ctx = await _get_news_thread_context(limit=8)
+
     system = f"""{SOUL_LUCA}
 
 Stai scrivendo un commento a caldo su una notizia videoludica per un canale Telegram.
@@ -174,7 +176,10 @@ Regole:
 - Parti direttamente con la tua reazione/analisi
 - Sii opinionato: prendi una posizione, non fare il neutro
 - Usa il formato Telegram: *grassetto* solo per parole chiave importanti
-- Niente emoji tranne al massimo una alla fine se appropriata"""
+- Niente emoji tranne al massimo una alla fine se appropriata
+- NON commentare notizie simili a quelle che hai già trattato di recente
+
+{thread_ctx}"""
 
     return await call_llm(
         system=system,
@@ -223,11 +228,31 @@ Scrivi in italiano. Prosa fluida come un editoriale."""
     )
 
 
+async def _get_news_thread_context(limit: int = 5) -> str:
+    """Recupera le ultime conversazioni nel topic news per il contesto."""
+    try:
+        from memory_vector import get_recent_conversations
+        recents = await get_recent_conversations(topic="news", limit=limit)
+        if not recents:
+            return ""
+        lines = ["## Ultime discussioni nel topic News (non ripetere questi argomenti già trattati)"]
+        for r in recents:
+            from memory_vector import _time_ago
+            ago = _time_ago(r["created_at"])
+            lines.append(f"- [{ago}] D: {r['question'][:80]} → R: {r['answer'][:120]}")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Errore thread context news: {e}")
+        return ""
+
+
 async def luca_answer_question(question: str) -> str:
     """
     Luca risponde a una domanda libera dell'utente nel topic news.
     Risponde come critico videoludico — con opinioni, contesto storico, senza filtri.
     """
+    thread_ctx = await _get_news_thread_context()
+
     system = f"""{SOUL_LUCA}
 
 Un utente ti ha scritto nel topic news/videogiochi del canale Telegram.
@@ -239,7 +264,10 @@ Regole:
 - Puoi fare riferimenti storici ad altri giochi o momenti dell'industria
 - Lunghezza: 3-6 frasi, mai oltre
 - Formato Telegram: *grassetto* per titoli/nomi importanti
-- Scrivi in italiano"""
+- Scrivi in italiano
+- NON ripetere o parafrasare risposte che hai già dato di recente
+
+{thread_ctx}"""
 
     return await call_llm(
         system=system,

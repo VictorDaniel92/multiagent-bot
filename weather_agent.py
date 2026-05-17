@@ -144,6 +144,24 @@ def format_for_llm(city_name: str, hours_data: list[dict]) -> str:
 
 # ── AGENTE GIORGIO ────────────────────────────────────────────────────────────
 
+async def _get_meteo_thread_context(limit: int = 4) -> str:
+    """Recupera le ultime previsioni già date nel topic meteo."""
+    try:
+        from memory_vector import get_recent_conversations
+        recents = await get_recent_conversations(topic="meteo", agent="giorgio", limit=limit)
+        if not recents:
+            return ""
+        lines = ["## Previsioni che hai già dato di recente (non ripetere le stesse identiche osservazioni)"]
+        for r in recents:
+            from memory_vector import _time_ago
+            ago = _time_ago(r["created_at"])
+            lines.append(f"- [{ago}] {r['question'][:60]} → {r['answer'][:100]}")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Errore thread context meteo: {e}")
+        return ""
+
+
 async def giorgio_forecast(city: dict, hours: int = 8) -> str:
     """Giorgio racconta il meteo delle prossime N ore per una città."""
     data = await fetch_weather(city["lat"], city["lon"], hours)
@@ -152,11 +170,15 @@ async def giorgio_forecast(city: dict, hours: int = 8) -> str:
 
     hours_data   = parse_next_hours(data, hours)
     weather_text = format_for_llm(city["name"], hours_data)
+    thread_ctx   = await _get_meteo_thread_context()
 
     system = f"""{SOUL_GIORGIO}
 
 Stai dando le previsioni meteo per le prossime {hours} ore nel tuo stile da TG.
-Hai i dati precisi — usali, non inventare nulla."""
+Hai i dati precisi — usali, non inventare nulla.
+Se hai già dato previsioni simili di recente, varia il tono e aggiungi dettagli nuovi.
+
+{thread_ctx}"""
 
     return await call_llm(
         system=system,
