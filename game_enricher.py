@@ -347,142 +347,82 @@ async def fetch_hltb(client: httpx.AsyncClient, game_name: str, data: GameData):
 
 async def fetch_psnprofiles(client: httpx.AsyncClient, game_name: str, data: GameData):
     """
-    Step 1: trova la lista trofei su PSNProfiles e recupera completion rate.
-    Step 2: cerca la guida al platino e ne estrae i dettagli.
+    Usa Serper per trovare l'URL della guida platino su PSNProfiles,
+    poi scrapa la guida per i dettagli.
     """
-    query = game_name.replace(" ", "+")
-    url   = f"https://psnprofiles.com/trophies?q={query}"
+    from search import web_search
 
-    resp = await _get(client, url)
+    # Cerca la guida tramite Google (evita il 403 di PSNProfiles)
+    results = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: web_search(f'site:psnprofiles.com/guide "{game_name}" trophy guide platinum', max_results=3)
+    )
+
+    guide_url  = None
+    trophy_url = None
+
+    for r in results:
+        href = r.get("href", "")
+        if "psnprofiles.com/guide/" in href and not guide_url:
+            guide_url = href
+        if "psnprofiles.com/trophies/" in href and not trophy_url:
+            trophy_url = href
+
+    # Fallback senza virgolette
+    if not guide_url:
+        results2 = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: web_search(f'site:psnprofiles.com/guide {game_name} platinum guide', max_results=3)
+        )
+        for r in results2:
+            href = r.get("href", "")
+            if "psnprofiles.com/guide/" in href:
+                guide_url = href
+                break
+
+    logger.info(f"PSNProfiles Serper: guide={guide_url} trophies={trophy_url}")
+
+    if trophy_url:
+        data.psn_url = trophy_url
+    if guide_url:
+        data.psn_guide_url = guide_url
+        await _scrape_psn_guide(client, guide_url, data)
+
+
+async def _scrape_psn_guide(client: httpx.AsyncClient, guide_url: str, data: GameData):
+    """Scrapa la pagina della guida per estrarre difficoltà, tempo, playthrough, missabili."""
+    resp = await _get(client, guide_url)
     if not resp:
-        data.errors.append("psnprofiles: timeout/errore")
+        logger.info(f"PSN Guide: impossibile scrapare {guide_url}")
         return
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # ── Trova URL lista trofei ─────────────────────────────────────────────
-    game_url = None
-    first = soup.find("li", class_=re.compile(r"game-item|title-item")) \
-          or soup.select_one("#games-list li, table.zebra tr:not(:first-child)")
-
-    if first:
-        link = first.find("a", href=re.compile(r"/trophies/"))
-        if link:
-            game_url = "https://psnprofiles.com" + link["href"]
-    else:
-        game_link = soup.find("a", href=re.compile(r"/trophies/\d+"))
-        if game_link:
-            game_url = "https://psnprofiles.com" + game_link["href"]
-
-    if game_url:
-        data.psn_url = game_url
-        # Recupera completion rate dalla pagina trofei
-        resp2 = await _get(client, game_url)
-        if resp2:
-            soup2 = BeautifulSoup(resp2.text, "html.parser")
-            for el in soup2.find_all(string=re.compile(r"Platinum|completat", re.I)):
-                parent = el.parent
-                if parent:
-                    m = re.search(r"(\d+(?:\.\d+)?)\s*%", parent.get_text())
-                    if m:
-                        data.psn_completion = f"{m.group(1)}%"
-                        break
-
-    # ── Step 2: cerca la guida al platino ─────────────────────────────────
-    await _fetch_psn_guide(client, game_name, data)
-
-    logger.debug(f"PSNProfiles: {game_name} → diff={data.psn_guide_difficulty}, "
-                 f"time={data.psn_time_to_plat}, missable={data.psn_missable}")
-
-
-async def _fetch_psn_guide(client: httpx.AsyncClient, game_name: str, data: GameData):
-    """
-    Cerca e scrapa la guida al platino su PSNProfiles.
-    """
-    query        = game_name.replace(" ", "+")
-    guide_search = f"https://psnprofiles.com/guides?q={query}"
-
-    resp = await _get(client, guide_search)
-    if not resp:
-        logger.info(f"PSN Guide: nessuna risposta per '{game_name}'")
-        return
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    # Debug: mostra tutti i link /guide/ trovati
-    all_guide_links = [a["href"] for a in soup.find_all("a", href=True) if "/guide/" in a["href"]]
-    logger.info(f"PSN Guide search '{game_name}': trovati {len(all_guide_links)} link → {all_guide_links[:5]}")
-
-    guide_url = None
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "/guide/" in href and href != "/guides":
-            guide_url = ("https://psnprofiles.com" + href) if href.startswith("/") else href
-            break
-
-    if not guide_url:
-        # Fallback: prova URL diretto con slug
-        slug      = _slug(game_name)
-        fallback  = f"https://psnprofiles.com/guides?q={slug}"
-        resp2     = await _get(client, fallback)
-        if resp2:
-            soup2 = BeautifulSoup(resp2.text, "html.parser")
-            for a in soup2.find_all("a", href=True):
-                href = a["href"]
-                if "/guide/" in href and href != "/guides":
-                    guide_url = ("https://psnprofiles.com" + href) if href.startswith("/") else href
-                    break
-
-    if not guide_url:
-        logger.info(f"PSN Guide: nessuna guida trovata per '{game_name}'")
-        return
-
-    logger.info(f"PSN Guide trovata: {guide_url}")
-    data.psn_guide_url = guide_url
-
-    # Scrapa la guida
-    resp2 = await _get(client, guide_url)
-    if not resp2:
-        return
-
-    soup2 = BeautifulSoup(resp2.text, "html.parser")
-
-    # Le guide PSNProfiles hanno una tabella "overview" con righe tipo:
-    # "Estimated trophy difficulty" | "4/10"
-    # "Approximate amount of time"  | "40-50 hours"
-    # "Minimum number of playthroughs" | "2"
-    # "Number of missable trophies" | "3" oppure "None"
-    # "Online trophies"             | "0"
-
-    # Mappa campi → attributo GameData
     field_map = {
-        r"difficulty":      "psn_guide_difficulty",
-        r"time.*plat|hours.*plat|approximate.*time": "psn_time_to_plat",
-        r"playthrough":     "psn_playthroughs",
-        r"missable":        "psn_missable",
+        r"difficulty":                   "psn_guide_difficulty",
+        r"time.*plat|approximate.*time": "psn_time_to_plat",
+        r"playthrough":                  "psn_playthroughs",
+        r"missable":                     "psn_missable",
     }
 
-    # Cerca nella tabella overview
-    for row in soup2.find_all("tr"):
+    for row in soup.find_all("tr"):
         cells = row.find_all(["td", "th"])
         if len(cells) < 2:
             continue
         label = cells[0].get_text(" ", strip=True).lower()
         value = cells[1].get_text(" ", strip=True)
-
+        if not value:
+            continue
         for pattern, attr in field_map.items():
-            if re.search(pattern, label, re.I) and value and not getattr(data, attr):
-                # Normalizza tempo in italiano
+            if re.search(pattern, label, re.I) and not getattr(data, attr):
                 if attr == "psn_time_to_plat":
                     value = _normalize_time(value)
-                # Normalizza missable
                 if attr == "psn_missable":
                     value = _normalize_missable(value)
                 setattr(data, attr, value)
 
-    # Fallback: cerca come lista di definizioni <dt>/<dd>
     if not data.psn_guide_difficulty:
-        for dt in soup2.find_all("dt"):
+        for dt in soup.find_all("dt"):
             label = dt.get_text(strip=True).lower()
             dd    = dt.find_next_sibling("dd")
             if not dd:
@@ -496,9 +436,8 @@ async def _fetch_psn_guide(client: httpx.AsyncClient, game_name: str, data: Game
                         value = _normalize_missable(value)
                     setattr(data, attr, value)
 
-    logger.debug(f"PSN Guide: {game_name} → {data.psn_guide_url} | "
-                 f"diff={data.psn_guide_difficulty} time={data.psn_time_to_plat} "
-                 f"miss={data.psn_missable} play={data.psn_playthroughs}")
+    logger.info(f"PSN Guide scraped: diff={data.psn_guide_difficulty} "
+                f"time={data.psn_time_to_plat} miss={data.psn_missable} play={data.psn_playthroughs}")
 
 
 def _normalize_time(value: str) -> str:
