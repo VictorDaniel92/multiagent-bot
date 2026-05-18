@@ -24,6 +24,8 @@ from mentor_agent import (
     format_analysis_for_telegram, ANALYZABLE_AGENTS,
     mentor_extract_proposed_soul, apply_soul_change,
     reload_agent_soul, restore_soul_backup,
+    init_mentor_db, save_mentor_proposal,
+    mark_proposal_applied, mark_proposal_rejected,
 )
 from news_agent import (
     fetch_new_multiplayer_news, fetch_recent_news,
@@ -761,6 +763,11 @@ async def _run_mentor_for_agent(
         "analysis":      report["analysis"],
     }
 
+    # Salva nel DB per storico permanente (anti-rollback)
+    summary = report["analysis"][:200].replace("\n", " ")
+    diff    = proposed_soul[:150].replace("\n", " ")
+    await save_mentor_proposal(proposal_id, agent_name, summary, diff)
+
     keyboard = _mentor_keyboard(agent_name, proposal_id)
     await reply_fn(
         text=analysis_text + f"\n\n_ID proposta: `{proposal_id}`_",
@@ -876,28 +883,26 @@ async def handle_mentor_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     # ── ✅ APPLICA ────────────────────────────────────────────────────────────
     if action == "mentor_apply":
-        ok_write  = apply_soul_change(agent_name, proposal["proposed_soul"])
-        ok_reload = reload_agent_soul(agent_name) if ok_write else False
+        await mark_proposal_applied(proposal_id)
+        proposed_soul = proposal["proposed_soul"]
 
-        if ok_write and ok_reload:
-            await query.edit_message_text(
-                f"✅ *Soul di {agent_name.capitalize()} aggiornato e ricaricato in memoria.*\n\n"
-                f"Il backup del soul precedente è in `souls/{agent_name}.bak.md`.\n"
-                f"Usa `/mentor {agent_name}` tra qualche giorno per verificare i miglioramenti.",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        elif ok_write and not ok_reload:
-            await query.edit_message_text(
-                f"⚠️ Soul scritto su disco ma *non ricaricato in memoria*.\n"
-                f"L'agente {agent_name} userà il nuovo soul solo dopo il prossimo restart.",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        else:
-            await query.edit_message_text(
-                f"❌ Errore durante la scrittura del soul di {agent_name}. Riprova.",
-            )
+        # Su Railway il filesystem è effimero — mandiamo il contenuto da pushare su git
+        await query.edit_message_text(
+            f"✅ *Proposta per {agent_name.capitalize()} approvata.*\n\n"
+            f"Copia il testo qui sotto in `souls/{agent_name}.md` e pusha su git.\n"
+            f"Railway ricaricherà il soul al prossimo deploy.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        # Manda il soul completo come messaggio separato facile da copiare
+        soul_msg = f"```\n{proposed_soul}\n```"
+        if len(soul_msg) > 4096:
+            soul_msg = soul_msg[:4090] + "\n```"
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=soul_msg,
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
-        # Rimuovi la proposta dalla memoria
         proposals.pop(proposal_id, None)
 
     # ── ✏️ MODIFICA ───────────────────────────────────────────────────────────
@@ -923,6 +928,7 @@ async def handle_mentor_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     # ── ❌ RIFIUTA ────────────────────────────────────────────────────────────
     elif action == "mentor_reject":
+        await mark_proposal_rejected(proposal_id)
         await query.edit_message_text(
             f"❌ *Proposta per {agent_name.capitalize()} rifiutata.*\n"
             f"Il soul rimane invariato.",
@@ -1085,6 +1091,7 @@ async def post_init(app):
     await init_profiles_db()
     await init_episode_db()
     await init_agent_state_db()
+    await init_mentor_db()
 
     # Avvia il server webhook in parallelo
     set_bot_app(app)
