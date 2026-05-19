@@ -3,21 +3,150 @@ mentor_agent.py — Il Mentor: analisi e proposta di miglioramento degli agenti.
 
 Architettura (step attuali):
   1. ANALISI  — legge le ultime N conversazioni per agente dal vector store
+               + storico modifiche precedenti per evitare rollback
   2. PROPOSTA — genera report con diff al soul.md
-  [ approvazione e applicazione: step successivi ]
+  3. APPROVAZIONE — bottoni inline ✅ ✏️ ❌
+  4. APPLICAZIONE — scrive soul.md e ricarica in memoria
 """
 
+import json
 import logging
 from pathlib import Path
 from datetime import datetime
 
+from sqlalchemy import Column, String, Text, DateTime, select
+from sqlalchemy.orm import DeclarativeBase
+
 from agents import call_llm, load_soul
 from memory_vector import get_recent_conversations
+import memory as mem
 
 logger = logging.getLogger(__name__)
 
 SOULS_DIR   = Path(__file__).parent / "souls"
 SOUL_MENTOR = load_soul("mentor")
+
+
+# ── STORICO MODIFICHE ─────────────────────────────────────────────────────────
+
+class MentorBase(DeclarativeBase):
+    pass
+
+
+class MentorHistory(MentorBase):
+    """
+    Storico di tutte le proposte del Mentor, applicate o rifiutate.
+    Iniettato nel prompt ad ogni nuova analisi per evitare rollback involontari.
+    """
+    __tablename__ = "mentor_history"
+
+    id          = Column(String,   primary_key=True)   # proposal_id
+    agent_name  = Column(String,   nullable=False)
+    proposed_at = Column(DateTime, default=datetime.utcnow)
+    status      = Column(String,   nullable=False, default="pending")
+                                                       # pending / applied / rejected
+    analysis_summary = Column(Text, nullable=False, default="")  # breve sintesi
+    diff_description = Column(Text, nullable=False, default="")  # cosa cambiava
+    applied_at       = Column(DateTime, nullable=True)
+
+
+async def init_mentor_db():
+    if not mem.engine:
+        logger.warning("Engine DB non disponibile — mentor DB non inizializzato")
+        return
+    async with mem.engine.begin() as conn:
+        await conn.run_sync(MentorBase.metadata.create_all)
+    logger.info("DB mentor_history inizializzato ✅")
+
+
+async def save_mentor_proposal(
+    proposal_id: str, agent_name: str,
+    analysis_summary: str, diff_description: str,
+):
+    if not mem.SessionLocal:
+        return
+    async with mem.SessionLocal() as db:
+        existing = await db.execute(
+            select(MentorHistory).where(MentorHistory.id == proposal_id)
+        )
+        if not existing.scalar_one_or_none():
+            db.add(MentorHistory(
+                id=proposal_id,
+                agent_name=agent_name,
+                analysis_summary=analysis_summary,
+                diff_description=diff_description,
+                status="pending",
+            ))
+            await db.commit()
+
+
+async def mark_proposal_applied(proposal_id: str):
+    if not mem.SessionLocal:
+        return
+    async with mem.SessionLocal() as db:
+        result = await db.execute(
+            select(MentorHistory).where(MentorHistory.id == proposal_id)
+        )
+        row = result.scalar_one_or_none()
+        if row:
+            row.status     = "applied"
+            row.applied_at = datetime.utcnow()
+            await db.commit()
+
+
+async def mark_proposal_rejected(proposal_id: str):
+    if not mem.SessionLocal:
+        return
+    async with mem.SessionLocal() as db:
+        result = await db.execute(
+            select(MentorHistory).where(MentorHistory.id == proposal_id)
+        )
+        row = result.scalar_one_or_none()
+        if row:
+            row.status = "rejected"
+            await db.commit()
+
+
+async def get_agent_history(agent_name: str, limit: int = 10) -> list[dict]:
+    """Carica le ultime N proposte per un agente — da iniettare nel prompt."""
+    if not mem.SessionLocal:
+        return []
+    async with mem.SessionLocal() as db:
+        result = await db.execute(
+            select(MentorHistory)
+            .where(MentorHistory.agent_name == agent_name)
+            .order_by(MentorHistory.proposed_at.desc())
+            .limit(limit)
+        )
+        rows = result.scalars().all()
+    return [
+        {
+            "id":               r.id,
+            "proposed_at":      str(r.proposed_at)[:16],
+            "status":           r.status,
+            "analysis_summary": r.analysis_summary,
+            "diff_description": r.diff_description,
+            "applied_at":       str(r.applied_at)[:16] if r.applied_at else None,
+        }
+        for r in rows
+    ]
+
+
+def _format_history_for_prompt(history: list[dict]) -> str:
+    """Formatta lo storico per il prompt del Mentor."""
+    if not history:
+        return ""
+
+    lines = ["## Storico modifiche precedenti (non riproporre quanto già applicato)\n"]
+    for h in history:
+        status_icon = {"applied": "✅", "rejected": "❌", "pending": "⏳"}.get(h["status"], "?")
+        lines.append(
+            f"{status_icon} [{h['proposed_at']}] {h['status'].upper()}\n"
+            f"   Modifica: {h['diff_description']}\n"
+            f"   Analisi:  {h['analysis_summary'][:120]}\n"
+        )
+    return "\n".join(lines)
+
 
 # Agenti analizzabili dal Mentor e il loro nome nel vector store
 # Mappa nome_logico → nome_agente_nel_DB (come salvato da save_conversation in bot.py)
@@ -113,6 +242,10 @@ async def mentor_analyze_agent(agent_name: str, limit: int = 20) -> dict:
     soul_section = f"## Soul attuale di {agent_name}\n{current_soul}" if current_soul else ""
     agent_desc   = AGENT_DESCRIPTIONS.get(agent_name, "")
 
+    # Carica storico modifiche per evitare rollback
+    history      = await get_agent_history(agent_name, limit=10)
+    history_text = _format_history_for_prompt(history)
+
     conv_text = _format_conversations_for_analysis(conversations)
 
     system = f"""{SOUL_MENTOR}
@@ -121,6 +254,8 @@ Stai analizzando le conversazioni recenti dell'agente **{agent_name}**.
 Ruolo: {agent_desc}
 
 {soul_section}
+
+{history_text}
 
 Il tuo compito è identificare pattern nelle risposte e proporre miglioramenti
 SPECIFICI e APPLICABILI al soul.md dell'agente.
