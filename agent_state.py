@@ -10,6 +10,7 @@ import json
 import logging
 from datetime import datetime
 from typing import Any
+import time
 
 from sqlalchemy import Column, String, Text, Float, Integer, DateTime, select
 from sqlalchemy.orm import DeclarativeBase
@@ -18,6 +19,9 @@ import memory as mem
 from agents import call_llm
 
 logger = logging.getLogger(__name__)
+
+# Cache in-memory per get_all_shared_states (invalidata quando uno stato viene scritto)
+_shared_states_cache: dict = {"data": None, "ts": 0.0}
 
 
 # ── MODELLI DB ────────────────────────────────────────────────────────────────
@@ -202,9 +206,16 @@ async def update_perspective(
     Aggiorna la 'visione' che l'agente ha dell'utente, incorporando
     la nuova interazione. Usa il LLM per sintetizzare.
     Ritorna la nuova perspective (stringa).
+    Throttle: aggiorna solo ogni 5 interazioni per risparmiare token.
     """
     if not current_perspective and not new_exchange:
-        return ""
+        return current_perspective or ""
+
+    # Throttle — aggiorna solo ogni 5 interazioni
+    state = await get_agent_state(agent_name, user_id)
+    count = state.get("interaction_count", 0)
+    if count > 0 and count % 5 != 0:
+        return current_perspective or ""
 
     prompt = f"""Sei {agent_name}. Stai aggiornando la tua comprensione di questo utente.
 
@@ -277,18 +288,25 @@ async def set_shared_state(agent_name: str, current_focus: str = None, recent_in
         if recent_insight is not None: row.recent_insight = recent_insight
         row.updated_at = datetime.utcnow()
         await db.commit()
+    # Invalida la cache
+    _shared_states_cache["ts"] = 0.0
 
 
 async def get_all_shared_states() -> list[dict]:
-    """Carica lo stato condiviso di tutti gli agenti — usato da Sophia."""
+    """Carica lo stato condiviso di tutti gli agenti — usato da Sophia.
+    Cache 60s in memoria per evitare una query DB per ogni messaggio."""
     if not mem.SessionLocal:
         return []
+
+    now = time.monotonic()
+    if now - _shared_states_cache["ts"] < 60 and _shared_states_cache["data"] is not None:
+        return _shared_states_cache["data"]
 
     async with mem.SessionLocal() as db:
         result = await db.execute(select(AgentSharedState))
         rows = result.scalars().all()
 
-    return [
+    data = [
         {
             "agent_name":     r.agent_name,
             "current_focus":  r.current_focus,
@@ -297,6 +315,9 @@ async def get_all_shared_states() -> list[dict]:
         }
         for r in rows
     ]
+    _shared_states_cache["data"] = data
+    _shared_states_cache["ts"]   = now
+    return data
 
 
 def format_shared_states_for_prompt(states: list[dict]) -> str:
@@ -370,7 +391,18 @@ async def extract_goals_from_message(agent_name: str, question: str) -> list[str
     Usa il LLM per capire se il messaggio esprime un obiettivo da monitorare.
     Es: "segui l'uscita di GTA6" → ["monitorare uscita GTA6"]
     Ritorna lista vuota se non ci sono obiettivi espliciti.
+    Fast-path: se non ci sono keyword trigger, salta la chiamata LLM.
     """
+    # Fast-path: chiama l'LLM solo se ci sono keyword esplicite di monitoraggio
+    _GOAL_TRIGGERS = (
+        "segui", "seguimi", "avvisami", "monitora", "ricordami",
+        "fammi sapere", "tienimi aggiornato", "notificami", "avvisa",
+        "quando esce", "quando uscirà", "aspetto", "voglio sapere quando",
+    )
+    q_lower = question.lower()
+    if not any(t in q_lower for t in _GOAL_TRIGGERS):
+        return []
+
     raw = await call_llm(
         system=(
             "Sei un estrattore di obiettivi. "

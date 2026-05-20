@@ -12,7 +12,7 @@ from telegram.ext import (
 from telegram.constants import ParseMode, ChatAction
 
 from agents import run_pipeline
-from memory import init_db, get_memory, set_memory, update_topics, format_memory_for_prompt
+from memory import init_db, get_memory, set_memory, update_topics
 from session_memory import (
     init_episode_db, get_or_create_session,
     add_user_message, add_agent_message,
@@ -453,19 +453,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── VIAGGI (Marco) ─────────────────────────────────────────────────────
     if topic == "viaggi":
-        from agents import call_llm
-        import json as _json
-        guard_result = await call_llm(
-            system='Classificatore. La domanda riguarda viaggi, mete, itinerari, cosa fare/vedere/mangiare in una città? Rispondi SOLO con JSON: {"ok": true} oppure {"ok": false}',
-            messages=[{"role": "user", "content": f"Domanda: {question}"}],
-            max_tokens=20
+        guard_result = await contextual_guard(
+            question, "viaggi", user_id,
+            "viaggi, mete, itinerari, cosa fare/vedere/mangiare in una città"
         )
-        try:
-            ok = _json.loads(guard_result.strip()).get("ok", True)
-        except Exception:
-            ok = True
-
-        if not ok:
+        if not guard_result["ok"]:
             await message.reply_text(
                 "🗺️ Questo topic è dedicato ai *viaggi*!\n\n"
                 "Chiedimi itinerari, mete, cosa vedere o mangiare in una città.\n"
@@ -516,7 +508,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await add_user_message(user_id, topic, question)
 
     # ── PIPELINE GENERALE ─────────────────────────────────────────────────
-    # Carica profilo ricco — sostituisce il vecchio format_memory_for_prompt
+    # Carica profilo ricco
     profile        = await get_profile(user_id)
     memory_context = format_profile_for_prompt(profile)
 
@@ -525,14 +517,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if past_memories:
         memory_context += "\n\n" + format_memories_for_prompt(past_memories)
 
-    # Integra con pattern episodici (comportamento a lungo termine)
-    episode_pattern = await get_user_episode_pattern(user_id, days=14)
-    if episode_pattern:
-        memory_context += f"\n\n## Pattern comportamentali recenti\n{episode_pattern}"
+    # Integra con pattern episodici — cache in user_data, ricalcola ogni 10 messaggi
+    ep_cache     = context.user_data.get("episode_pattern", {})
+    ep_count     = context.user_data.get("episode_count", 0)
+    ep_count    += 1
+    context.user_data["episode_count"] = ep_count
+    if ep_count % 10 == 1 or "pattern" not in ep_cache:
+        ep_pattern = await get_user_episode_pattern(user_id, days=14)
+        context.user_data["episode_pattern"] = {"pattern": ep_pattern}
+    else:
+        ep_pattern = ep_cache.get("pattern", "")
+    if ep_pattern:
+        memory_context += f"\n\n## Pattern comportamentali recenti\n{ep_pattern}"
 
     # ── STATO AGENTE ──────────────────────────────────────────────────────
     agent_context = await build_agent_context("alex", user_id)
-    # Estrai eventuali obiettivi dal messaggio e salvali
     new_goals = await extract_goals_from_message("alex", question)
     for goal in new_goals:
         await add_goal("alex", user_id, goal)

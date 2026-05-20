@@ -131,6 +131,21 @@ def _slug(name: str) -> str:
 # ── STEP 0: RILEVA IL NOME DEL GIOCO DALLA DOMANDA ───────────────────────────
 
 async def detect_game_name(question: str) -> str | None:
+    """
+    Estrae il titolo di un gioco dalla domanda.
+    Fast-path: se non ci sono keyword gaming, salta la chiamata LLM.
+    """
+    _GAMING_SIGNALS = (
+        "gioco", "game", "giochi", "games", "ps5", "ps4", "xbox", "nintendo",
+        "switch", "steam", "playstation", "pc", "gdr", "rpg", "fps", "platino",
+        "trofeo", "trophy", "metacritic", "recensione", "dlc", "patch", "uscita",
+        "quanto dura", "difficile", "difficoltà", "completare", "finire",
+    )
+    q_lower = question.lower()
+    # Se non c'è nessun segnale gaming, non vale la pena chiamare l'LLM
+    if not any(s in q_lower for s in _GAMING_SIGNALS) and len(question.split()) < 5:
+        return None
+
     raw = await call_llm(
         system=(
             "Sei un estrattore di nomi di videogiochi. "

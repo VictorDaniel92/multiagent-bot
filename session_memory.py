@@ -156,16 +156,52 @@ async def contextual_guard(
     topic_description: str,
 ) -> dict:
     """
-    Guard che valuta se la domanda è appropriata per il topic,
-    tenendo conto del contesto della sessione.
-
-    Restituisce: {"ok": bool, "reason": str}
-
-    Logica:
-    1. Se c'è contesto di sessione, lo passa al guard
-    2. Il guard ragiona: "nel contesto della conversazione, questa domanda è nel topic?"
-    3. "quanto dura?" + contesto "Elden Ring" → ok nel topic news/gaming
+    Guard che valuta se la domanda è appropriata per il topic.
+    Fast-path: keyword matching prima dell'LLM.
+    Se le keyword sono decisive, non chiama l'LLM.
+    Altrimenti usa l'LLM con contesto della sessione.
     """
+    # ── FAST-PATH: follow-up brevi sono sempre ok ─────────────────────────
+    # Domande di follow-up ("e quello?", "quanto dura?", "perché?") sono
+    # quasi certamente nel topic se c'è contesto di sessione
+    _FOLLOWUP = ("e quello", "e questa", "quanto dura", "perché", "come mai",
+                 "davvero", "sicuro", "e invece", "cosa ne pensi", "e tu")
+    q_lower = question.strip().lower()
+    if any(q_lower.startswith(f) or q_lower == f for f in _FOLLOWUP):
+        session = await get_or_create_session(user_id, topic)
+        if session.messages:
+            return {"ok": True, "reason": ""}
+
+    # ── FAST-PATH: keyword esplicite per topic ────────────────────────────
+    _TOPIC_KEYWORDS: dict[str, list[str]] = {
+        "news":          ["gioco", "gaming", "videogioco", "ps5", "xbox", "nintendo",
+                          "steam", "recensione", "dlc", "patch", "uscita", "platino",
+                          "trofeo", "multiplayer.it", "metacritic"],
+        "meteo":         ["meteo", "tempo", "pioggia", "sole", "vento", "temperatura",
+                          "previsioni", "caldo", "freddo", "neve", "forecast"],
+        "viaggi":        ["viaggio", "vacanza", "itinerario", "weekend", "visitare",
+                          "albergo", "volo", "meta", "cosa fare", "cosa vedere"],
+        "coding":        ["codice", "code", "python", "bug", "funzione", "script",
+                          "errore", "classe", "api", "database", "git"],
+        "brainstorming": ["idea", "idee", "brainstorm", "spunto", "inventare",
+                          "proposta", "alternativa", "creativo"],
+        "analisi":       ["analisi", "analizza", "confronta", "valuta", "pro",
+                          "contro", "struttura", "dati", "statistica"],
+        "ricerca":       ["cerca", "ricerca", "cos'è", "cosa è", "spiega",
+                          "chi è", "quando", "dove", "informazioni"],
+    }
+    keywords = _TOPIC_KEYWORDS.get(topic, [])
+    if keywords:
+        if any(k in q_lower for k in keywords):
+            return {"ok": True, "reason": ""}
+        # Se ci sono keyword di un ALTRO topic in modo esplicito, blocca senza LLM
+        for other_topic, other_kw in _TOPIC_KEYWORDS.items():
+            if other_topic == topic:
+                continue
+            if sum(1 for k in other_kw if k in q_lower) >= 2:
+                return {"ok": False, "reason": f"sembra una domanda per il topic {other_topic}"}
+
+    # ── LLM: per i casi ambigui ───────────────────────────────────────────
     context = await get_session_context(user_id, topic, max_messages=3)
 
     system = f"""Sei un classificatore di messaggi per un canale Telegram.
@@ -173,11 +209,8 @@ Topic corrente: {topic} — {topic_description}
 
 {f"Contesto della conversazione recente:{chr(10)}{context}{chr(10)}" if context else ""}
 
-Valuta se il messaggio dell'utente è appropriato per questo topic,
-tenendo conto del contesto conversazionale se presente.
-
-IMPORTANTE: se il messaggio sembra una domanda di follow-up a qualcosa detto nel contesto
-(es. "quanto dura?", "e quello?", "perché?"), consideralo appropriato se il contesto è nel topic.
+Valuta se il messaggio dell'utente è appropriato per questo topic.
+Se è un follow-up al contesto, consideralo appropriato.
 
 Rispondi SOLO con JSON: {{"ok": true}} oppure {{"ok": false, "reason": "motivo breve"}}"""
 
