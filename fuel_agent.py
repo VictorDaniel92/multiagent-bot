@@ -123,6 +123,7 @@ async def get_monthly_average(province: str, fuel_type: str) -> float | None:
 def _fetch_mise_prices(province: str) -> dict | None:
     """
     Chiama l'API Mise e restituisce i prezzi medi per provincia.
+    Se il server risponde 403 (blocca cloud), usa Serper come fallback.
     Restituisce: {benzina: float, gasolio: float, gpl: float} o None se errore.
     """
     try:
@@ -135,7 +136,6 @@ def _fetch_mise_prices(province: str) -> dict | None:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read())
 
-        # L'API restituisce lista di record per tipo carburante
         prices = {}
         for item in data:
             tipo  = item.get("carburante", "").lower()
@@ -151,12 +151,63 @@ def _fetch_mise_prices(province: str) -> dict | None:
         return prices if prices else None
 
     except Exception as e:
-        logger.error(f"Errore fetch Mise {province}: {e}")
+        status = getattr(getattr(e, "code", None), "__str__", lambda: str(e))()
+        is_403 = "403" in str(e) or "Forbidden" in str(e)
+        logger.warning(f"Fetch Mise {province} fallito ({e}) — {'uso Serper' if is_403 else 'nessun fallback'}")
+        if is_403:
+            return _fetch_mise_via_serper(province)
+        return None
+
+
+def _fetch_mise_via_serper(province: str) -> dict | None:
+    """
+    Fallback: usa Serper per trovare i prezzi della provincia
+    su siti aggregatori che riportano i dati MISE.
+    """
+    from search import web_search
+
+    city_name = next(
+        (v["name"] for v in CITIES.values() if v["province"] == province),
+        province
+    )
+    query = f"prezzi benzina gasolio self service {city_name} oggi €/litro"
+
+    try:
+        results = web_search(query, max_results=5)
+        if not results:
+            return None
+
+        # Cerca prezzi nei snippet — pattern tipo "1.789 €/L" o "1,789"
+        import re
+        prices = {}
+        combined_text = " ".join(r.get("body", "") + " " + r.get("title", "") for r in results)
+
+        # Benzina
+        m = re.search(r"benzina[^\d]{0,20}(1[.,]\d{3})", combined_text, re.I)
+        if m:
+            prices["benzina"] = float(m.group(1).replace(",", "."))
+
+        # Gasolio
+        m = re.search(r"gasolio[^\d]{0,20}(1[.,]\d{3})", combined_text, re.I)
+        if not m:
+            m = re.search(r"diesel[^\d]{0,20}(1[.,]\d{3})", combined_text, re.I)
+        if m:
+            prices["gasolio"] = float(m.group(1).replace(",", "."))
+
+        if prices:
+            logger.info(f"Prezzi {province} via Serper: {prices}")
+            return prices
+
+        logger.warning(f"Serper: nessun prezzo trovato per {province}")
+        return None
+
+    except Exception as e:
+        logger.error(f"Errore Serper fallback {province}: {e}")
         return None
 
 
 def _fetch_national_average() -> dict | None:
-    """Recupera la media nazionale dal Mise."""
+    """Recupera la media nazionale dal Mise, con fallback Serper."""
     try:
         now = datetime.now()
         url = f"https://carburanti.mise.gov.it/ospzApi/api/inRete/nazMese/{now.year}/{now.month:02d}"
@@ -179,8 +230,35 @@ def _fetch_national_average() -> dict | None:
         return prices if prices else None
 
     except Exception as e:
-        logger.error(f"Errore fetch media nazionale: {e}")
+        logger.warning(f"Fetch media nazionale fallita ({e}) — uso Serper")
+        return _fetch_national_via_serper()
+
+
+def _fetch_national_via_serper() -> dict | None:
+    """Fallback Serper per media nazionale carburanti."""
+    from search import web_search
+    import re
+
+    results = web_search("media nazionale benzina gasolio self service oggi €/litro", max_results=5)
+    if not results:
         return None
+
+    combined = " ".join(r.get("body", "") + " " + r.get("title", "") for r in results)
+    prices   = {}
+
+    m = re.search(r"benzina[^\d]{0,20}(1[.,]\d{3})", combined, re.I)
+    if m:
+        prices["benzina"] = float(m.group(1).replace(",", "."))
+
+    m = re.search(r"gasolio[^\d]{0,20}(1[.,]\d{3})", combined, re.I)
+    if not m:
+        m = re.search(r"diesel[^\d]{0,20}(1[.,]\d{3})", combined, re.I)
+    if m:
+        prices["gasolio"] = float(m.group(1).replace(",", "."))
+
+    if prices:
+        logger.info(f"Media nazionale via Serper: {prices}")
+    return prices or None
 
 
 # ── ANALISI E RISPOSTA ────────────────────────────────────────────────────────
