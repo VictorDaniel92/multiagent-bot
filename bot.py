@@ -38,6 +38,7 @@ from weather_agent import (
 )
 from marco_agent import marco_answer_question
 from strike_agent import sophia_strike_response, job_check_strikes
+from fuel_agent import get_fuel_report, extract_city_from_question, init_fuel_db
 from memory_vector import (
     init_vector_db, save_conversation,
     search_memories, format_memories_for_prompt,
@@ -258,6 +259,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"Errore ricerca scioperi: {e}")
                 await status_msg.edit_text("⚠️ Non riesco a cercare informazioni sugli scioperi al momento.")
+            return
+
+        # Controlla se è una domanda sulla benzina
+        fuel_triggers = r'\b(benzina|gasolio|diesel|carburante|rifornimento|prezz[oi] benzina|gpl)\b'
+        if re.search(fuel_triggers, clean_question, re.IGNORECASE):
+            status_msg = await message.reply_text("⛽ *Sophia* sta controllando i prezzi...", parse_mode=ParseMode.MARKDOWN)
+            try:
+                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+                cities = await extract_city_from_question(clean_question)
+                answer = await get_fuel_report(cities)
+                await status_msg.delete()
+                await message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
+            except Exception as e:
+                logger.error(f"Errore prezzi benzina: {e}")
+                await status_msg.edit_text("⚠️ Non riesco a recuperare i prezzi al momento.")
             return
 
         # Routing intelligente
@@ -1107,6 +1123,7 @@ async def post_init(app):
     await init_episode_db()
     await init_agent_state_db()
     await init_mentor_db()
+    await init_fuel_db()
 
     # Avvia il server webhook in parallelo
     set_bot_app(app)
