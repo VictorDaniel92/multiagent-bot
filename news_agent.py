@@ -398,7 +398,7 @@ async def luca_answer_question(question: str, profile_context: str = "") -> str:
     - domanda sul platino: 2 chiamate (detect + platinum answer con dati guida)
     """
     from game_enricher import detect_game_name, enrich_game_data
-    from search import web_search, format_results
+    from search import async_web_search, format_results
 
     is_platinum_question = bool(re.search(
         r'\b(platino|platinum|trofei|trophy|trophies|missabili?|playthrough|completare al 100)\b',
@@ -407,9 +407,7 @@ async def luca_answer_question(question: str, profile_context: str = "") -> str:
 
     # Ricerca Google sempre in background (sincrona, non costa token LLM)
     search_query   = f"{question} {datetime.date.today().year}"
-    search_results = await asyncio.get_event_loop().run_in_executor(
-        None, lambda: web_search(search_query, max_results=3)
-    )
+    search_results = await async_web_search(search_query, max_results=3)
     # Tronca a 800 chars — abbastanza per dati aggiornati, non troppo da bruciare token
     web_context = f"\n\n## Aggiornamenti:\n{format_results(search_results)[:800]}" if search_results else ""
 

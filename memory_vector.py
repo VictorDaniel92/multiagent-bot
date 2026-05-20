@@ -36,6 +36,15 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 # Pool di connessioni asyncpg (separato da SQLAlchemy usato in memory.py)
 _pool: Optional[asyncpg.Pool] = None
 
+# Client HTTP persistente per Cohere
+_cohere_client: Optional[httpx.AsyncClient] = None
+
+async def _get_cohere_client() -> httpx.AsyncClient:
+    global _cohere_client
+    if _cohere_client is None or _cohere_client.is_closed:
+        _cohere_client = httpx.AsyncClient(timeout=15)
+    return _cohere_client
+
 
 # ── Connessione ────────────────────────────────────────────────────────────────
 
@@ -76,6 +85,20 @@ async def init_vector_db():
                 USING hnsw (embedding vector_cosine_ops)
             """)
 
+            # Indici B-tree per query frequenti (topic, agent, created_at)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS conversations_topic_idx
+                ON conversations (topic)
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS conversations_user_topic_idx
+                ON conversations (user_id, topic)
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS conversations_created_at_idx
+                ON conversations (created_at DESC)
+            """)
+
         logger.info("Vector DB inizializzato ✅")
 
     except Exception as e:
@@ -90,25 +113,25 @@ async def get_embedding(text: str) -> list[float] | None:
     if not COHERE_API_KEY:
         return None
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.post(
-                "https://api.cohere.com/v2/embed",
-                headers={
-                    "Authorization": f"Bearer {COHERE_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model":      COHERE_MODEL,
-                    "texts":      [text[:2048]],  # limite sicuro
-                    "input_type": "search_document",
-                    "embedding_types": ["float"],
-                }
-            )
-            data = response.json()
-            if response.status_code != 200:
-                logger.error(f"Cohere error {response.status_code}: {data}")
-                return None
-            return data["embeddings"]["float"][0]
+        client = await _get_cohere_client()
+        response = await client.post(
+            "https://api.cohere.com/v2/embed",
+            headers={
+                "Authorization": f"Bearer {COHERE_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model":      COHERE_MODEL,
+                "texts":      [text[:2048]],
+                "input_type": "search_document",
+                "embedding_types": ["float"],
+            }
+        )
+        data = response.json()
+        if response.status_code != 200:
+            logger.error(f"Cohere error {response.status_code}: {data}")
+            return None
+        return data["embeddings"]["float"][0]
     except Exception as e:
         logger.error(f"Errore embedding Cohere: {e}")
         return None
@@ -119,24 +142,24 @@ async def get_query_embedding(text: str) -> list[float] | None:
     if not COHERE_API_KEY:
         return None
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.post(
-                "https://api.cohere.com/v2/embed",
-                headers={
-                    "Authorization": f"Bearer {COHERE_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model":      COHERE_MODEL,
-                    "texts":      [text[:2048]],
-                    "input_type": "search_query",
-                    "embedding_types": ["float"],
-                }
-            )
-            data = response.json()
-            if response.status_code != 200:
-                return None
-            return data["embeddings"]["float"][0]
+        client = await _get_cohere_client()
+        response = await client.post(
+            "https://api.cohere.com/v2/embed",
+            headers={
+                "Authorization": f"Bearer {COHERE_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model":      COHERE_MODEL,
+                "texts":      [text[:2048]],
+                "input_type": "search_query",
+                "embedding_types": ["float"],
+            }
+        )
+        data = response.json()
+        if response.status_code != 200:
+            return None
+        return data["embeddings"]["float"][0]
     except Exception as e:
         logger.error(f"Errore query embedding: {e}")
         return None

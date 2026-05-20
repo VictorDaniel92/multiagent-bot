@@ -1,39 +1,41 @@
 import os
 import json
-import urllib.request
-import urllib.parse
+import asyncio
 import logging
+import httpx
 
 logger = logging.getLogger(__name__)
 
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
 SERPER_URL     = "https://google.serper.dev/search"
 
+# Client persistente per Serper
+_serper_client: httpx.AsyncClient | None = None
 
-def web_search(query: str, max_results: int = 4) -> list[dict]:
-    """
-    Cerca usando Serper (Google Search API).
-    Gratuito fino a 2500 ricerche/mese, nessuna configurazione extra.
-    """
+async def _get_serper_client() -> httpx.AsyncClient:
+    global _serper_client
+    if _serper_client is None or _serper_client.is_closed:
+        _serper_client = httpx.AsyncClient(timeout=10)
+    return _serper_client
+
+
+async def async_web_search(query: str, max_results: int = 4) -> list[dict]:
+    """Versione asincrona di web_search — usa httpx direttamente."""
     if not SERPER_API_KEY:
         logger.error("SERPER_API_KEY mancante!")
         return [{"title": "Config mancante", "href": "", "body": "SERPER_API_KEY non configurata."}]
 
     try:
-        payload = json.dumps({"q": query, "num": max_results}).encode("utf-8")
-        req = urllib.request.Request(
+        client = await _get_serper_client()
+        response = await client.post(
             SERPER_URL,
-            data=payload,
             headers={
                 "X-API-KEY":    SERPER_API_KEY,
                 "Content-Type": "application/json",
             },
-            method="POST"
+            json={"q": query, "num": max_results},
         )
-
-        with urllib.request.urlopen(req, timeout=10) as response:
-            data = json.loads(response.read())
-
+        data  = response.json()
         items = data.get("organic", [])
         logger.info(f"Serper: {len(items)} risultati per '{query}'")
         return [
@@ -44,7 +46,42 @@ def web_search(query: str, max_results: int = 4) -> list[dict]:
             }
             for item in items[:max_results]
         ]
+    except Exception as e:
+        logger.error(f"Errore Serper: {e}")
+        return [{"title": "Errore ricerca", "href": "", "body": f"Ricerca fallita: {e}. Usa la tua conoscenza."}]
 
+
+def web_search(query: str, max_results: int = 4) -> list[dict]:
+    """
+    Versione sincrona mantenuta per compatibilità con sofia_synthesize e max_plan
+    che girano dentro asyncio ma chiamano web_search in modo sincrono.
+    Internamente usa httpx sincrono — più efficiente di urllib.
+    """
+    if not SERPER_API_KEY:
+        logger.error("SERPER_API_KEY mancante!")
+        return [{"title": "Config mancante", "href": "", "body": "SERPER_API_KEY non configurata."}]
+
+    try:
+        with httpx.Client(timeout=10) as client:
+            response = client.post(
+                SERPER_URL,
+                headers={
+                    "X-API-KEY":    SERPER_API_KEY,
+                    "Content-Type": "application/json",
+                },
+                json={"q": query, "num": max_results},
+            )
+        data  = response.json()
+        items = data.get("organic", [])
+        logger.info(f"Serper: {len(items)} risultati per '{query}'")
+        return [
+            {
+                "title": item.get("title", ""),
+                "href":  item.get("link", ""),
+                "body":  item.get("snippet", ""),
+            }
+            for item in items[:max_results]
+        ]
     except Exception as e:
         logger.error(f"Errore Serper: {e}")
         return [{"title": "Errore ricerca", "href": "", "body": f"Ricerca fallita: {e}. Usa la tua conoscenza."}]

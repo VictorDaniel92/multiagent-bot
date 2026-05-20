@@ -365,13 +365,10 @@ async def fetch_psnprofiles(client: httpx.AsyncClient, game_name: str, data: Gam
     Usa Serper per trovare l'URL della guida platino su PSNProfiles,
     poi scrapa la guida per i dettagli.
     """
-    from search import web_search
+    from search import async_web_search
 
     # Cerca la guida tramite Google (evita il 403 di PSNProfiles)
-    results = await asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: web_search(f'site:psnprofiles.com/guide "{game_name}" trophy guide platinum', max_results=3)
-    )
+    results = await async_web_search(f'site:psnprofiles.com/guide "{game_name}" trophy guide platinum', max_results=3)
 
     guide_url  = None
     trophy_url = None
@@ -385,10 +382,7 @@ async def fetch_psnprofiles(client: httpx.AsyncClient, game_name: str, data: Gam
 
     # Fallback senza virgolette
     if not guide_url:
-        results2 = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: web_search(f'site:psnprofiles.com/guide {game_name} platinum guide', max_results=3)
-        )
+        results2 = await async_web_search(f'site:psnprofiles.com/guide {game_name} platinum guide', max_results=3)
         for r in results2:
             href = r.get("href", "")
             if "psnprofiles.com/guide/" in href:
@@ -414,7 +408,7 @@ async def _scrape_psn_guide(client: httpx.AsyncClient, guide_url: str, data: Gam
     game_name = data.name
 
     # Una sola query mirata invece di due
-    results = await asyncio.get_event_loop().run_in_executor(
+    results = await asyncio.get_running_loop().run_in_executor(
         None,
         lambda: web_search(
             f'psnprofiles "{game_name}" platinum difficulty hours playthroughs missable',

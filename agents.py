@@ -8,6 +8,15 @@ logger = logging.getLogger(__name__)
 
 SOULS_DIR = Path(__file__).parent / "souls"
 
+# Client HTTP persistente — riutilizza le connessioni invece di aprirne una nuova ad ogni chiamata
+_http_client: httpx.AsyncClient | None = None
+
+async def get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=60)
+    return _http_client
+
 
 # ── CARICAMENTO SOUL FILES ────────────────────────────────────────────────────
 
@@ -226,19 +235,19 @@ async def call_llm(system: str, messages: list[dict], max_tokens: int = 1024) ->
             continue
 
         try:
-            async with httpx.AsyncClient(timeout=60) as client:
-                response = await client.post(
-                    provider["url"],
-                    headers={
-                        "Authorization": f"Bearer {provider['api_key']}",
-                        "Content-Type":  "application/json",
-                    },
-                    json={
-                        "model":      provider["model"],
-                        "max_tokens": max_tokens,
-                        "messages":   payload_messages,
-                    },
-                )
+            client = await get_http_client()
+            response = await client.post(
+                provider["url"],
+                headers={
+                    "Authorization": f"Bearer {provider['api_key']}",
+                    "Content-Type":  "application/json",
+                },
+                json={
+                    "model":      provider["model"],
+                    "max_tokens": max_tokens,
+                    "messages":   payload_messages,
+                },
+            )
 
             if response.status_code == 200:
                 data = response.json()
