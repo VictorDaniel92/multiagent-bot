@@ -37,6 +37,7 @@ from weather_agent import (
     extract_city, giorgio_forecast, giorgio_morning_briefing, MORNING_CITIES
 )
 from marco_agent import marco_answer_question
+from strike_agent import sophia_strike_response, job_check_strikes
 from memory_vector import (
     init_vector_db, save_conversation,
     search_memories, format_memories_for_prompt,
@@ -243,6 +244,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             from sophia_agent import sophia_answer_with_memory
             answer = await sophia_answer_with_memory(clean_question)
             await message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
+            return
+
+        # Controlla se è una domanda sugli scioperi
+        strike_triggers = r'\b(sciopero|scioperi|atm|bus|metro|tram|trasporti)\b'
+        if re.search(strike_triggers, clean_question, re.IGNORECASE):
+            status_msg = await message.reply_text("🔍 *Sophia* sta cercando notizie di sciopero...", parse_mode=ParseMode.MARKDOWN)
+            try:
+                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+                answer = await sophia_strike_response()
+                await status_msg.delete()
+                await message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
+            except Exception as e:
+                logger.error(f"Errore ricerca scioperi: {e}")
+                await status_msg.edit_text("⚠️ Non riesco a cercare informazioni sugli scioperi al momento.")
             return
 
         # Routing intelligente
@@ -1128,6 +1143,14 @@ async def post_init(app):
             time=datetime.time(8, 0, 0),   # domenica 08:00 UTC = 10:00 CEST
             days=(6,),                      # 6 = domenica
             name="mentor_weekly",
+        )
+
+    # Job scioperi — ogni mattina alle 7:30, avvisa solo se ci sono scioperi
+    if os.environ.get("ENABLE_STRIKE_JOB", "false").lower() == "true":
+        app.job_queue.run_daily(
+            job_check_strikes,
+            time=datetime.time(5, 30, 0),  # 05:30 UTC = 07:30 CEST
+            name="check_strikes",
         )
 
     # Promemoria sempre attivi
